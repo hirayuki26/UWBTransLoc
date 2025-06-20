@@ -1,59 +1,761 @@
-# Scripts
-from scripts.utils import (load_data)#, save_fig, create_subreport, save_report, filter_out_low_WAPS)
-# from scripts.errors import compute_errors
-# from scripts.plots import plot_pos_vs_time, plot_lat_vs_lon
-# from scripts.models import (load_KNN, load_Random_Forest, load_SVM,
-#                            load_Decision_Tree, threshold_variance, pca)
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import pandas as pd
+import numpy as np
+import os
+from sklearn.preprocessing import MinMaxScaler
+import random
+import copy
+import math
 
-# Libraries
-from time import time
-# from sklearn.model_selection import train_test_split
-# from matplotlib.pyplot import close, ioff, ion
-# from pandas import DataFrame, concat
+# デバイス設定
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
 
-# Hyper-parameters / CONSTANTS
-N = 520 # Number of WAPS - CONSTANT
-MIN_WAPS = 9 # Required number of active WAPS per sample.
-NO_SIGNAL_VALUE = -98 # Changed Null Value
-QUANTITATIVE_COLUMNS = ['x', 'y'] # Regression Columns
-DROP_VAL = True # if True, drops the validation dataset which may be corrupted
-# Used to remove columns where information is missing the validation data.
-DROP_COLUMNS = None #["SPACEID" ,"RELATIVEPOSITION", "USERID"]
-SAVE_FIGS = False # Trigger to save/overwrite figures(saves 5 seconds if False)
-SAVE_REPORT = False # Trigger to save/overwrite report
-PRINT_SUB = False # Trigger to print sub reports or not.
-DISPLAY_PLOTS = False # If true, the 20 figures will be created on screen.
+# --- 1. データセットの準備とデータローダーの定義 ---
+class WiFiDataset(Dataset):
+    def __init__(self, filepath, rss_cols, loc_cols, transform=None, target_transform=None):
+        data = pd.read_csv(filepath)
+        self.rss_data = data[rss_cols].values
+        self.loc_data = data[loc_cols].values
+        self.transform = transform
+        self.target_transform = target_transform
 
-################################## MAIN #######################################
+    def __len__(self):
+        return len(self.rss_data)
+
+    def __getitem__(self, idx):
+        rss = self.rss_data[idx]
+        loc = self.loc_data[idx]
+
+        if self.transform:
+            rss = self.transform(rss)
+        if self.target_transform:
+            loc = self.target_transform(loc)
+        
+        return torch.tensor(rss, dtype=torch.float32), torch.tensor(loc, dtype=torch.float32)
+
+def create_dataloaders(source_train_path, target_train_path, target_test_path):
+    # RSSおよび位置情報の列名を動的に取得
+    sample_df = pd.read_csv(source_train_path)
+    all_cols = sample_df.columns.tolist()
+    loc_cols = ['X', 'Y'] # X and Y are location columns 
+    rss_cols = [col for col in all_cols if col not in loc_cols]
+
+    # データ読み込み（スケーリング用）
+    source_train_data = pd.read_csv(source_train_path)
+    target_train_data = pd.read_csv(target_train_path)
+    target_test_data = pd.read_csv(target_test_path)
+
+    # 全てのRSSデータを結合し、包括的なスケーリング範囲を設定
+    all_rss_data = pd.concat([
+        source_train_data[rss_cols],
+        target_train_data[rss_cols],
+        target_test_data[rss_cols]
+    ])
     
+    # 全ての位置データを結合し、スケーリング
+    all_loc_data = pd.concat([
+        source_train_data[loc_cols],
+        target_train_data[loc_cols],
+        target_test_data[loc_cols]
+    ])
+
+    # スケーラーの初期化
+    rss_scaler = MinMaxScaler(feature_range=(-1, 1)) # RSSを-1から1に正規化 
+    loc_scaler = MinMaxScaler(feature_range=(0, 1)) # 位置を0から1に正規化
+
+    # 結合データでスケーラーをフィット
+    rss_scaler.fit(all_rss_data)
+    loc_scaler.fit(all_loc_data)
+
+    # 変換定義
+    rss_transform = lambda x: rss_scaler.transform(x.reshape(1, -1)).flatten()
+    loc_transform = lambda y: loc_scaler.transform(y.reshape(1, -1)).flatten()
+
+    # データセット作成
+    source_train_dataset = WiFiDataset(source_train_path, rss_cols, loc_cols, transform=rss_transform, target_transform=loc_transform)
+    target_train_dataset = WiFiDataset(target_train_path, rss_cols, loc_cols, transform=rss_transform, target_transform=loc_transform)
+    target_test_dataset = WiFiDataset(target_test_path, rss_cols, loc_cols, transform=rss_transform, target_transform=loc_transform)
+
+    # データローダー作成
+    batch_size = 64 
+    source_train_loader = DataLoader(source_train_dataset, batch_size=batch_size, shuffle=True)
+    target_train_loader = DataLoader(target_train_dataset, batch_size=batch_size, shuffle=True)
+    target_test_loader = DataLoader(target_test_dataset, batch_size=batch_size, shuffle=False)
+
+    # 後で逆変換が必要な場合に備えてスケーラーを保存
+    data_scalers = {
+        'rss_scaler': rss_scaler,
+        'loc_scaler': loc_scaler,
+        'rss_cols': rss_cols,
+        'loc_cols': loc_cols
+    }
+
+    return source_train_loader, target_train_loader, target_test_loader, data_scalers
+
+# --- 2. TransLocのネットワークアーキテクチャ定義 ---
+
+# スペクトル正規化のラッパー関数 
+def spectral_norm(module):
+    return torch.nn.utils.spectral_norm(module)
+
+# ConvBlk (CNN Block) 
+class ConvBlk(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding):
+        super(ConvBlk, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, stride=stride, padding=padding)
+        self.bn = nn.BatchNorm2d(out_channels) # 
+        self.relu = nn.LeakyReLU(0.1) # 
+        self.pool = nn.AvgPool2d(kernel_size=2, stride=2) # 
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.bn(x)
+        x = self.relu(x)
+        x = self.pool(x)
+        return x
+
+# DeConvBlk (Deconvolutional Block) 
+class DeConvBlk(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding=0):
+        super(DeConvBlk, self).__init__()
+        self.deconv = nn.ConvTranspose2d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, output_padding=output_padding) # 
+        self.bn = nn.BatchNorm2d(out_channels) # 
+        self.relu = nn.LeakyReLU(0.1) # 
+        self.upsample = nn.Upsample(scale_factor=2, mode='nearest') # 
+
+    def forward(self, x):
+        x = self.deconv(x)
+        x = self.bn(x)
+        x = self.relu(x)
+        x = self.upsample(x)
+        return x
+
+# Feature Extractor 
+class FeatureExtractor(nn.Module):
+    def __init__(self, input_dim, z_dim=16): # z_dim is latent feature dimension 
+        super(FeatureExtractor, self).__init__()
+        self.fc_initial = nn.Linear(input_dim, 1024) # 
+        # Reshape to 32x32 for CNNs 
+        self.conv_blk1 = ConvBlk(in_channels=1, out_channels=16, kernel_size=5, stride=1, padding=2) # 5x5x16 
+        self.conv_blk2 = ConvBlk(in_channels=16, out_channels=32, kernel_size=5, stride=1, padding=2) # 5x5x32 
+        # Final FC layer to get z_dim 
+        self.fc_final = nn.Linear(32 * 8 * 8, z_dim) # Output size after two ConvBlk (32*32 -> 16*16 -> 8*8)
+
+    def forward(self, x):
+        x = self.fc_initial(x)
+        x = x.view(-1, 1, 32, 32) # Reshape to (batch_size, channels, height, width)
+        x = self.conv_blk1(x)
+        x = self.conv_blk2(x)
+        x = x.view(x.size(0), -1) # Flatten for FC layer
+        z = self.fc_final(x)
+        return z
+
+# Generator 
+class Generator(nn.Module):
+    def __init__(self, z_dim=16, output_dim=1024, domain_dim=1): 
+        super(Generator, self).__init__()
+        # Z (16) + Domain (1) input for FC layer initially 
+        self.fc_initial = nn.Linear(z_dim + domain_dim, 2048) # 
+        
+        self.deconv_blk1_input_channels = 32 # Assuming 2048 is reshaped to 8x8x32
+        self.deconv_blk1 = DeConvBlk(self.deconv_blk1_input_channels, 16, kernel_size=5, stride=1, padding=2) # 5x5x16 
+        self.deconv_blk2 = DeConvBlk(16, 1, kernel_size=5, stride=1, padding=2) # 5x5x1 
+        
+        # Final layer to match the original input dimension (1024 as vector)
+        self.final_conv_to_vector = nn.Conv2d(1, 1, kernel_size=1) 
+        self.fc_final_output = nn.Linear(32*32*1, output_dim) 
+
+    def forward(self, z, domain_label):
+        if domain_label.dim() == 1:
+            domain_label = domain_label.unsqueeze(1) 
+        
+        combined_input = torch.cat([z, domain_label], dim=1)
+
+        x = self.fc_initial(combined_input)
+        
+        # Reshape for DCNN layers. Assuming 8x8 spatial dimensions.
+        spatial_dim_start = int(math.sqrt(x.size(1) / self.deconv_blk1_input_channels))
+        if spatial_dim_start * spatial_dim_start * self.deconv_blk1_input_channels != x.size(1):
+            spatial_dim_start = 8 # Fallback if calculation is not perfect
+            
+        x = x.view(x.size(0), self.deconv_blk1_input_channels, spatial_dim_start, spatial_dim_start) 
+        
+        x = self.deconv_blk1(x)
+        x = self.deconv_blk2(x) 
+        
+        # Final output transformation to match the original input vector dimension
+        x = self.final_conv_to_vector(x)
+        reconstructed_fingerprint = self.fc_final_output(x.view(x.size(0), -1))
+        
+        return reconstructed_fingerprint
+
+# Discriminator 
+class Discriminator(nn.Module):
+    def __init__(self, input_dim, domain_dim=1):
+        super(Discriminator, self).__init__()
+        self.fc_initial = nn.Linear(input_dim, 1024)
+        
+        self.conv_blk1 = ConvBlk(in_channels=1, out_channels=8, kernel_size=5, stride=1, padding=2) # 5x5x8 
+        self.conv_blk2 = ConvBlk(in_channels=8, out_channels=16, kernel_size=5, stride=1, padding=2) # 5x5x16 
+
+        self.common_fc_output_dim = 16 * 8 * 8 
+
+        # Discriminator for source domain (D_s) 
+        self.fc_ds1 = spectral_norm(nn.Linear(self.common_fc_output_dim, 256)) 
+        self.fc_ds2 = spectral_norm(nn.Linear(256, 128))
+        self.fc_ds3 = spectral_norm(nn.Linear(128, 32))
+        self.fc_ds4 = spectral_norm(nn.Linear(32, 1)) # Binary output for real/fake (source)
+        
+        # Discriminator for target domain (D_t) 
+        self.fc_dt1 = spectral_norm(nn.Linear(self.common_fc_output_dim, 256))
+        self.fc_dt2 = spectral_norm(nn.Linear(256, 128))
+        self.fc_dt3 = spectral_norm(nn.Linear(128, 32))
+        self.fc_dt4 = spectral_norm(nn.Linear(32, 1)) # Binary output for real/fake (target)
+
+    def forward(self, x):
+        x = self.fc_initial(x)
+        x = x.view(-1, 1, 32, 32)
+        x = self.conv_blk1(x)
+        x = self.conv_blk2(x)
+        x = x.view(x.size(0), -1) 
+
+        # Source Discriminator branch
+        ds = self.fc_ds1(x)
+        ds = self.fc_ds2(ds)
+        ds = self.fc_ds3(ds)
+        ds_output = self.fc_ds4(ds) 
+
+        # Target Discriminator branch
+        dt = self.fc_dt1(x)
+        dt = self.fc_dt2(dt)
+        dt = self.fc_dt3(dt)
+        dt_output = self.fc_dt4(dt) 
+
+        return ds_output, dt_output
+
+# Location Predictor 
+class LocationPredictor(nn.Module):
+    def __init__(self, z_dim=16, output_loc_dim=2):
+        super(LocationPredictor, self).__init__()
+        # R_c (shared module) 
+        self.rc_fc1 = nn.Linear(z_dim, 1024)
+        self.rc_conv_blk = ConvBlk(in_channels=1, out_channels=16, kernel_size=5, stride=1, padding=2) # 5x5x16
+        self.rc_fc2 = nn.Linear(16 * 8 * 8, 2048) 
+
+        # R_1, R_2, R_3 (parallel sub-modules) 
+        self.r1_conv_blk = ConvBlk(in_channels=32, out_channels=16, kernel_size=5, stride=1, padding=2) 
+        self.r1_fc1 = nn.Linear(16 * 8 * 8, 2048)
+        self.r1_fc2 = nn.Linear(2048, output_loc_dim) # Output (X, Y) 
+
+        self.r2_conv_blk = ConvBlk(in_channels=32, out_channels=16, kernel_size=5, stride=1, padding=2)
+        self.r2_fc1 = nn.Linear(16 * 8 * 8, 2048)
+        self.r2_fc2 = nn.Linear(2048, output_loc_dim)
+
+        self.r3_conv_blk = ConvBlk(in_channels=32, out_channels=16, kernel_size=5, stride=1, padding=2)
+        self.r3_fc1 = nn.Linear(16 * 8 * 8, 2048)
+        self.r3_fc2 = nn.Linear(2048, output_loc_dim)
+
+    def forward(self, z):
+        # R_c (shared module)
+        rc_features = self.rc_fc1(z)
+        rc_features = rc_features.view(-1, 1, 32, 32) 
+        rc_features = self.rc_conv_blk(rc_features)
+        rc_features = rc_features.view(rc_features.size(0), -1) 
+        rc_features = self.rc_fc2(rc_features)
+        
+        # Reshape rc_features for conv_blk input of R1, R2, R3
+        rc_features_reshaped = rc_features.view(rc_features.size(0), 32, 8, 8)
+
+        # R_1 branch
+        r1_out = self.r1_conv_blk(rc_features_reshaped)
+        r1_out = r1_out.view(r1_out.size(0), -1)
+        r1_out = self.r1_fc1(r1_out)
+        r1_pred = r1_out # No activation after final fc_final 
+        r1_pred = self.r1_fc2(r1_pred)
+
+        # R_2 branch
+        r2_out = self.r2_conv_blk(rc_features_reshaped)
+        r2_out = r2_out.view(r2_out.size(0), -1)
+        r2_out = self.r2_fc1(r2_out)
+        r2_pred = r2_out # No activation after final fc_final 
+        r2_pred = self.r2_fc2(r2_pred)
+
+        # R_3 branch
+        r3_out = self.r3_conv_blk(rc_features_reshaped)
+        r3_out = r3_out.view(r3_out.size(0), -1)
+        r3_out = self.r3_fc1(r3_out)
+        r3_pred = r3_out # No activation after final fc_final 
+        r3_pred = self.r3_fc2(r3_pred)
+        
+        # Average of predictions for final output (Eq 9 in TransLoc paper) 
+        avg_pred = (r1_pred + r2_pred + r3_pred) / 3
+
+        return avg_pred, r1_pred, r2_pred, r3_pred
+
+# TransLocモデル全体の定義 
+class TransLoc(nn.Module):
+    def __init__(self, input_dim, z_dim, output_loc_dim, domain_dim=1):
+        super(TransLoc, self).__init__()
+        self.feature_extractor = FeatureExtractor(input_dim, z_dim).to(device)
+        self.generator = Generator(z_dim, input_dim, domain_dim).to(device) 
+        self.discriminator = Discriminator(input_dim, domain_dim).to(device)
+        self.location_predictor = LocationPredictor(z_dim, output_loc_dim).to(device)
+
+    def forward(self, x, domain_label):
+        # 個々のコンポーネントの呼び出しはトレーニングループ内で行われます。
+        pass
+
+
+# --- 3. 損失関数の定義 ---
+
+# 再構築損失 (L_GE) 
+# Mean Squared Error (MSE) を使用
+reconstruction_criterion = nn.MSELoss() 
+
+# 識別器の損失 (L_D) - Least Squares GANs (LSGANs) の損失を使用 
+# 論文ではb=1, a=0, c=1 (Eq 9) or b=1, a=-1, c=0 (Eq 8)が提案されているが、ここではBCEWithLogitsLossを使う場合のLSGANsの一般的な解釈に基づく。
+# PyTorchではnn.MSELoss()と組み合わせることが多い。
+# D(x) -> real, D(G(z)) -> fake
+# For D: min 0.5 * (D(x) - 1)^2 + 0.5 * (D(G(z)) - 0)^2
+# For G: min 0.5 * (D(G(z)) - 1)^2
+criterion_discriminator = nn.MSELoss()
+criterion_generator_adv = nn.MSELoss()
+
+# 位置予測器の損失 (L_R) 
+# MSE (Regression task) 
+location_criterion = nn.MSELoss()
+
+# サイクル一貫性損失 (L_CC) 
+# L1 Loss (MAE) for feature level and prediction level consistency
+cycle_consistency_criterion_f = nn.L1Loss() # 
+cycle_consistency_criterion_p = nn.MSELoss() #  (距離の二乗和)
+
+# --- 4. 学習戦略とトレーニングループ ---
+
+def train_transloc(model, source_train_loader, target_train_loader, target_test_loader, data_scalers,
+                   num_epochs=100, lr_fe_lp=0.0001, lr_g=0.0002, lr_d=0.0002,
+                   lambda_D=1, lambda_R=1, lambda_CC=1, epsilon_tri_net=1e-4):
+    
+    # オプティマイザの定義 
+    optimizer_fe = optim.Adam(model.feature_extractor.parameters(), lr=lr_fe_lp, betas=(0.5, 0.999))
+    optimizer_g = optim.Adam(model.generator.parameters(), lr=lr_g, betas=(0.5, 0.999))
+    optimizer_d = optim.Adam(model.discriminator.parameters(), lr=lr_d, betas=(0.5, 0.999))
+    optimizer_lp = optim.Adam(model.location_predictor.parameters(), lr=lr_fe_lp, betas=(0.5, 0.999))
+
+    # ハイパーパラメータeta (η) - 勾配反転層に相当する制御 
+    # 論文ではeta=10がデフォルト 
+    eta_gradient_reversal = 10 
+
+    # 事前学習フェーズ 
+    print("--- Pre-training Phase ---")
+    pretrain_epochs = 50 # Adjust based on complexity and convergence
+    for epoch in range(pretrain_epochs):
+        model.train()
+        total_reconstruction_loss = 0
+        total_source_lp_loss = 0
+
+        for i, (source_rss, source_loc) in enumerate(source_train_loader):
+            source_rss, source_loc = source_rss.to(device), source_loc.to(device)
+
+            # Feature ExtractorとGeneratorの事前学習 (L_GE) 
+            optimizer_fe.zero_grad()
+            optimizer_g.zero_grad()
+            
+            # Source DomainのZを抽出
+            z_s = model.feature_extractor(source_rss)
+            
+            # GeneratorでSource RSSを再構築
+            # ドメインラベルはSource (0) と仮定
+            source_domain_label = torch.zeros(source_rss.size(0), 1).to(device)
+            reconstructed_source_rss = model.generator(z_s, source_domain_label)
+            
+            loss_ge = reconstruction_criterion(reconstructed_source_rss, source_rss)
+            
+            loss_ge.backward()
+            optimizer_fe.step()
+            optimizer_g.step()
+            total_reconstruction_loss += loss_ge.item()
+
+            # Location Predictorの事前学習 (L_R^s) 
+            optimizer_lp.zero_grad()
+            
+            # Source DomainのZをLocation Predictorに入力
+            z_s_lp = model.feature_extractor(source_rss) # Feature Extractorは更新済み
+            predicted_loc_avg, predicted_loc_r1, predicted_loc_r2, predicted_loc_r3 = model.location_predictor(z_s_lp)
+            
+            # L_R^s = ||y_s_avg - y_s|| + 1/3 * sum(||y_s_i - y_s||) 
+            loss_rs = location_criterion(predicted_loc_avg, source_loc) + \
+                      (location_criterion(predicted_loc_r1, source_loc) + \
+                       location_criterion(predicted_loc_r2, source_loc) + \
+                       location_criterion(predicted_loc_r3, source_loc)) / 3
+            
+            loss_rs.backward()
+            optimizer_lp.step()
+            total_source_lp_loss += loss_rs.item()
+
+        print(f"Pre-Epoch {epoch+1}/{pretrain_epochs}, Rec Loss: {total_reconstruction_loss / len(source_train_loader):.4f}, Source LP Loss: {total_source_lp_loss / len(source_train_loader):.4f}")
+
+    print("--- Joint Training Phase ---")
+    # 共同学習フェーズ 
+    for epoch in range(num_epochs):
+        model.train()
+        total_loss_d = 0
+        total_loss_g_adv = 0
+        total_loss_g_rec = 0
+        total_loss_lp = 0
+        total_loss_cc_f = 0
+        total_loss_cc_p = 0
+
+        # データローダーをイテレート
+        # target_train_loader は unlabeled data (x_t) 
+        # source_train_loader は labeled data (x_s, y_s) 
+        # 各バッチでsourceとtargetのフィンガープリントをペアリング
+        # min_batches = min(len(source_train_loader), len(target_train_loader)) # Original idea for paired batches
+        
+        # Adjusting iteration for potentially unequal loader lengths
+        # Using a cyclic iterator for the smaller dataset to ensure all samples are processed
+        source_iter = iter(source_train_loader)
+        target_iter = iter(target_train_loader)
+
+        num_batches = max(len(source_train_loader), len(target_train_loader))
+
+        for i in range(num_batches):
+            try:
+                source_rss, source_loc = next(source_iter)
+            except StopIteration:
+                source_iter = iter(source_train_loader)
+                source_rss, source_loc = next(source_iter)
+
+            try:
+                target_rss, _ = next(target_iter) # Target data is unlabeled
+            except StopIteration:
+                target_iter = iter(target_train_loader)
+                target_rss, _ = next(target_iter)
+
+            source_rss, source_loc = source_rss.to(device), source_loc.to(device)
+            target_rss = target_rss.to(device)
+
+            real_labels = torch.ones(source_rss.size(0), 1).to(device)
+            fake_labels = torch.zeros(source_rss.size(0), 1).to(device)
+            
+            # Domain labels
+            source_domain_label = torch.zeros(source_rss.size(0), 1).to(device) # d_s = 0
+            target_domain_label = torch.ones(target_rss.size(0), 1).to(device)   # d_t = 1
+
+
+            # --- 1. Discriminatorの更新 (L_D) --- 
+            optimizer_d.zero_grad()
+
+            # Source Discriminator (D_s)
+            # Real source data
+            d_s_real, _ = model.discriminator(source_rss)
+            loss_ds_real = criterion_discriminator(d_s_real, real_labels[:d_s_real.size(0)])
+
+            # Fake source data (transformed from target to source)
+            # Z from target data
+            z_t = model.feature_extractor(target_rss)
+            fake_source_rss = model.generator(z_t, source_domain_label[:z_t.size(0)])
+            d_s_fake, _ = model.discriminator(fake_source_rss.detach()) # Detach to prevent G from updating
+            loss_ds_fake = criterion_discriminator(d_s_fake, fake_labels[:d_s_fake.size(0)])
+            
+            loss_ds = 0.5 * (loss_ds_real + loss_ds_fake) # Eq 5 (L_Ds) 
+
+
+            # Target Discriminator (D_t)
+            # Real target data
+            _, d_t_real = model.discriminator(target_rss)
+            loss_dt_real = criterion_discriminator(d_t_real, real_labels[:d_t_real.size(0)])
+
+            # Fake target data (transformed from source to target)
+            # Z from source data
+            z_s = model.feature_extractor(source_rss)
+            fake_target_rss = model.generator(z_s, target_domain_label[:z_s.size(0)])
+            _, d_t_fake = model.discriminator(fake_target_rss.detach()) # Detach to prevent G from updating
+            loss_dt_fake = criterion_discriminator(d_t_fake, fake_labels[:d_t_fake.size(0)])
+
+            loss_dt = 0.5 * (loss_dt_real + loss_dt_fake) # Eq 6 (L_Dt) 
+
+            loss_d = loss_ds + loss_dt # Eq 7 (L_D) 
+            
+            loss_d.backward()
+            optimizer_d.step()
+            total_loss_d += loss_d.item()
+
+
+            # --- 2. Feature Extractor, Generator, Location Predictorの更新 ---
+            # これらは共同で Discriminator を騙す (敵対的学習) 
+            # Generator は再構築損失 (L_GE) と敵対的損失 (Generatorの目標) 
+            # Feature Extractor は敵対的損失と位置予測損失 (L_R) 
+            # Location Predictor は位置予測損失 (L_R) 
+            # L_CC (サイクル一貫性損失) 
+
+            optimizer_fe.zero_grad()
+            optimizer_g.zero_grad()
+            optimizer_lp.zero_grad()
+
+            # L_GE: Reconstruction Loss 
+            # Source -> Z_s -> G(Z_s, d_s) -> Reconstructed Source
+            z_s = model.feature_extractor(source_rss)
+            reconstructed_source_rss = model.generator(z_s, source_domain_label)
+            loss_ge_s = reconstruction_criterion(reconstructed_source_rss, source_rss)
+            
+            # Target -> Z_t -> G(Z_t, d_t) -> Reconstructed Target
+            z_t = model.feature_extractor(target_rss)
+            reconstructed_target_rss = model.generator(z_t, target_domain_label)
+            loss_ge_t = reconstruction_criterion(reconstructed_target_rss, target_rss)
+            
+            loss_ge = loss_ge_s + loss_ge_t # Eq 3 (L_GE) 
+
+            # Generatorの敵対的損失 (Discriminatorを騙す) 
+            # L_GAN (G) = 0.5 * (D_s(G(Z_t, d_s)) - 1)^2 + 0.5 * (D_t(G(Z_s, d_t)) - 1)^2
+            
+            # Fake Source (Target -> Source)
+            z_t_for_g = model.feature_extractor(target_rss)
+            fake_source_rss_for_g = model.generator(z_t_for_g, source_domain_label[:z_t_for_g.size(0)])
+            d_s_fake_for_g, _ = model.discriminator(fake_source_rss_for_g)
+            loss_g_adv_s = criterion_generator_adv(d_s_fake_for_g, real_labels[:d_s_fake_for_g.size(0)])
+
+            # Fake Target (Source -> Target)
+            z_s_for_g = model.feature_extractor(source_rss)
+            fake_target_rss_for_g = model.generator(z_s_for_g, target_domain_label[:z_s_for_g.size(0)])
+            _, d_t_fake_for_g = model.discriminator(fake_target_rss_for_g)
+            loss_g_adv_t = criterion_generator_adv(d_t_fake_for_g, real_labels[:d_t_fake_for_g.size(0)])
+
+            loss_g_adv = 0.5 * (loss_g_adv_s + loss_g_adv_t)
+            total_loss_g_adv += loss_g_adv.item()
+
+            # L_R: Location Predictor Loss 
+            # Source Domain Fingerprints (L_R^s) 
+            z_s_lp = model.feature_extractor(source_rss)
+            predicted_loc_avg_s, predicted_loc_r1_s, predicted_loc_r2_s, predicted_loc_r3_s = model.location_predictor(z_s_lp)
+            
+            loss_rs = location_criterion(predicted_loc_avg_s, source_loc) + \
+                      (location_criterion(predicted_loc_r1_s, source_loc) + \
+                       location_criterion(predicted_loc_r2_s, source_loc) + \
+                       location_criterion(predicted_loc_r3_s, source_loc)) / 3 # Eq 10 
+
+            # Target Domain Fingerprints (L_R^t) - Pseudo-labeling 
+            # This part is simplified from Tri-net's full pseudo-labeling.
+            # For a full implementation, you'd collect pseudo-labels over epochs,
+            # refine them, and add to the loss. Here, a simpler approach.
+            # Tri-net details for pseudo-labeling:  Same Prediction, Confident Prediction, Stable Prediction.
+            # Using current batch to simulate pseudo-labeling.
+
+            pseudo_labeled_target_locs = []
+            valid_pseudo_labels_count = 0
+            
+            # Dropout for stable prediction 
+            model.location_predictor.train() # Enable dropout for stable prediction check
+            
+            z_t_lp_raw = model.feature_extractor(target_rss)
+
+            # Get multiple predictions with dropout enabled
+            num_dropout_predictions = 5 # Q times for stability 
+            r1_preds_dropout = [model.location_predictor(z_t_lp_raw)[1] for _ in range(num_dropout_predictions)]
+            r2_preds_dropout = [model.location_predictor(z_t_lp_raw)[2] for _ in range(num_dropout_predictions)]
+            r3_preds_dropout = [model.location_predictor(z_t_lp_raw)[3] for _ in range(num_dropout_predictions)]
+
+            # Disable dropout for confident/same prediction (using direct predictions)
+            model.location_predictor.eval() # Disable dropout for regular inference
+            with torch.no_grad(): # No gradient calculation for this part
+                _, r1_pred_no_dropout, r2_pred_no_dropout, r3_pred_no_dropout = model.location_predictor(z_t_lp_raw)
+
+            # Re-enable dropout for next training iteration
+            model.location_predictor.train()
+
+
+            for idx in range(target_rss.size(0)):
+                # Same Prediction 
+                # Compare two of the three sub-modules (e.g., R2 and R3 for R1's pseudo-label)
+                # Note: epsilon (ε) needs to be defined based on normalized location range.
+                epsilon_loc = epsilon_tri_net # A small quantity for distance comparison 
+
+                # R1's pseudo-label is from R2, R3
+                if torch.norm(r2_pred_no_dropout[idx] - r3_pred_no_dropout[idx]) < epsilon_loc:
+                    # Confident Prediction (R1 different from R2, R3) 
+                    if torch.norm(r1_pred_no_dropout[idx] - r2_pred_no_dropout[idx]) > epsilon_loc and \
+                       torch.norm(r1_pred_no_dropout[idx] - r3_pred_no_dropout[idx]) > epsilon_loc:
+                        # Stable Prediction 
+                        is_stable = True
+                        for q_idx in range(num_dropout_predictions):
+                            if torch.norm(r2_preds_dropout[q_idx][idx] - r2_pred_no_dropout[idx]) >= epsilon_loc or \
+                               torch.norm(r3_preds_dropout[q_idx][idx] - r3_pred_no_dropout[idx]) >= epsilon_loc:
+                                is_stable = False
+                                break
+                        if is_stable:
+                            pseudo_label = (r2_pred_no_dropout[idx] + r3_pred_no_dropout[idx]) / 2 # Eq 11 
+                            pseudo_labeled_target_locs.append((z_t_lp_raw[idx], pseudo_label, 0)) # Store (z, pseudo_y, sub_module_idx for R1)
+                            valid_pseudo_labels_count += 1
+
+                # R2's pseudo-label is from R1, R3
+                if torch.norm(r1_pred_no_dropout[idx] - r3_pred_no_dropout[idx]) < epsilon_loc:
+                     if torch.norm(r2_pred_no_dropout[idx] - r1_pred_no_dropout[idx]) > epsilon_loc and \
+                        torch.norm(r2_pred_no_dropout[idx] - r3_pred_no_dropout[idx]) > epsilon_loc:
+                        is_stable = True
+                        for q_idx in range(num_dropout_predictions):
+                            if torch.norm(r1_preds_dropout[q_idx][idx] - r1_pred_no_dropout[idx]) >= epsilon_loc or \
+                               torch.norm(r3_preds_dropout[q_idx][idx] - r3_pred_no_dropout[idx]) >= epsilon_loc:
+                                is_stable = False
+                                break
+                        if is_stable:
+                            pseudo_label = (r1_pred_no_dropout[idx] + r3_pred_no_dropout[idx]) / 2
+                            pseudo_labeled_target_locs.append((z_t_lp_raw[idx], pseudo_label, 1)) # sub_module_idx for R2
+                            valid_pseudo_labels_count += 1
+
+                # R3's pseudo-label is from R1, R2
+                if torch.norm(r1_pred_no_dropout[idx] - r2_pred_no_dropout[idx]) < epsilon_loc:
+                     if torch.norm(r3_pred_no_dropout[idx] - r1_pred_no_dropout[idx]) > epsilon_loc and \
+                        torch.norm(r3_pred_no_dropout[idx] - r2_pred_no_dropout[idx]) > epsilon_loc:
+                        is_stable = True
+                        for q_idx in range(num_dropout_predictions):
+                            if torch.norm(r1_preds_dropout[q_idx][idx] - r1_pred_no_dropout[idx]) >= epsilon_loc or \
+                               torch.norm(r2_preds_dropout[q_idx][idx] - r2_pred_no_dropout[idx]) >= epsilon_loc:
+                                is_stable = False
+                                break
+                        if is_stable:
+                            pseudo_label = (r1_pred_no_dropout[idx] + r2_pred_no_dropout[idx]) / 2
+                            pseudo_labeled_target_locs.append((z_t_lp_raw[idx], pseudo_label, 2)) # sub_module_idx for R3
+                            valid_pseudo_labels_count += 1
+
+            loss_rt = 0
+            if valid_pseudo_labels_count > 0:
+                # Calculate L_R^t using collected pseudo-labels
+                # This needs to be done on the specific sub-module for which the pseudo-label was generated
+                # And z_pl needs to be passed through the location_predictor again
+                for z_pl, y_pl, submodule_idx in pseudo_labeled_target_locs:
+                    z_pl = z_pl.unsqueeze(0) # Add batch dimension
+                    _, r1_p, r2_p, r3_p = model.location_predictor(z_pl)
+                    if submodule_idx == 0: # R1's pseudo-label
+                        loss_rt += location_criterion(r1_p, y_pl.unsqueeze(0))
+                    elif submodule_idx == 1: # R2's pseudo-label
+                        loss_rt += location_criterion(r2_p, y_pl.unsqueeze(0))
+                    elif submodule_idx == 2: # R3's pseudo-label
+                        loss_rt += location_criterion(r3_p, y_pl.unsqueeze(0))
+                loss_rt /= valid_pseudo_labels_count
+
+            loss_r = loss_rs + loss_rt # Eq 13 (L_R) 
+            total_loss_lp += loss_r.item()
+
+
+            # L_CC: Cycle Consistency Loss 
+            # L_CC^f: Feature-level cycle consistency 
+            # Source -> G(d_t) -> Fake_Target -> E -> Z_st
+            z_st = model.feature_extractor(fake_target_rss_for_g) # fake_target_rss_for_g from G(Z_s, d_t)
+            loss_cc_f = cycle_consistency_criterion_f(z_st, z_s_for_g) # Z_s from source_rss 
+            
+            # L_CC^p: Prediction-level cycle consistency 
+            # Fake_Target (from Source) -> Location Predictor -> y_st (should be close to y_s)
+            predicted_loc_avg_st, predicted_loc_r1_st, predicted_loc_r2_st, predicted_loc_r3_st = model.location_predictor(z_st)
+            
+            # ||y_st_avg - y_s|| + 1/3 * sum(||y_st_i - y_s||) 
+            loss_cc_p = cycle_consistency_criterion_p(predicted_loc_avg_st, source_loc) + \
+                        (cycle_consistency_criterion_p(predicted_loc_r1_st, source_loc) + \
+                         cycle_consistency_criterion_p(predicted_loc_r2_st, source_loc) + \
+                         cycle_consistency_criterion_p(predicted_loc_r3_st, source_loc)) / 3 # Eq 16 
+
+            loss_cc = loss_cc_f + loss_cc_p # Eq 17 (L_CC) 
+            total_loss_cc_f += loss_cc_f.item()
+            total_loss_cc_p += loss_cc_p.item()
+
+
+            # Total Objective (L) 
+            # λ_D, λ_R, λ_CC はハイパーパラメータ 
+            # Generator は敵対者なので、G/FE/LP の更新では Discriminator の勾配は反転して伝播させるイメージ
+            # PyTorchではそれぞれの損失を合計して逆伝播させることで実現
+            loss_total = loss_ge + lambda_D * loss_g_adv + lambda_R * loss_r + lambda_CC * loss_cc # Eq 18 (L) 
+            
+            loss_total.backward() # Backward on combined loss
+            optimizer_fe.step()
+            optimizer_g.step()
+            optimizer_lp.step()
+
+        # エポックごとの進捗表示
+        print(f"Epoch {epoch+1}/{num_epochs}, D_Loss: {total_loss_d / num_batches:.4f}, G_Adv_Loss: {total_loss_g_adv / num_batches:.4f}, "
+              f"LP_Loss: {total_loss_lp / num_batches:.4f}, CC_F_Loss: {total_loss_cc_f / num_batches:.4f}, CC_P_Loss: {total_loss_cc_p / num_batches:.4f}")
+
+        # テストセットでの評価 (測位精度)
+        if (epoch + 1) % 10 == 0: # 10エポックごとに評価
+            model.eval()
+            total_test_distance = 0
+            with torch.no_grad():
+                for test_rss, test_loc in target_test_loader:
+                    test_rss, test_loc = test_rss.to(device), test_loc.to(device)
+                    z_test = model.feature_extractor(test_rss)
+                    predicted_loc_avg, _, _, _ = model.location_predictor(z_test)
+                    
+                    # 予測位置を元のスケールに戻す
+                    predicted_loc_unscaled = data_scalers['loc_scaler'].inverse_transform(predicted_loc_avg.cpu().numpy())
+                    true_loc_unscaled = data_scalers['loc_scaler'].inverse_transform(test_loc.cpu().numpy())
+
+                    # ユークリッド距離で誤差を計算 (m単位) 
+                    distances = np.sqrt(np.sum((predicted_loc_unscaled - true_loc_unscaled)**2, axis=1))
+                    total_test_distance += np.sum(distances)
+            
+            avg_test_distance = total_test_distance / len(target_test_loader.dataset)
+            print(f"--- Epoch {epoch+1} Test Localization Error: {avg_test_distance:.4f} m --- ")
+            model.train() # Set back to train mode
+
+    print("Training finished.")
+
+
+# --- 実行部分 ---
 if __name__ == "__main__":
+    # データローダーの作成
+    source_train_path = './data/OfficeP2/csv/OfficeP2_1_training.csv'
+    target_train_path = './data/OfficeP2/csv/OfficeP2_2_training.csv'
+    target_test_path = './data/OfficeP2/csv/OfficeP2_2_testing.csv'
 
-    tic = time() # Start program performance timer
-    
-    # close("all") # Close all previously opened plots
-    
-    # ion() if DISPLAY_PLOTS else ioff()
-    
-    # Load and preprocess data with all methods that are independent of subset.
-    place_name = 'OfficeP2'
-    train_fname = 'OfficeP2_1_training'
-    test_fname = 'OfficeP2_4_testing'
-
-    x_train_o, y_train = load_data(
-        train_fname,
-        place_name,
-        drop_columns=DROP_COLUMNS,
-        dst_null= NO_SIGNAL_VALUE
+    source_train_loader, target_train_loader, target_test_loader, data_scalers = create_dataloaders(
+        source_train_path, target_train_path, target_test_path
     )
 
-    x_test_o, y_test = load_data(
-        test_fname,
-        place_name,
-        drop_columns=DROP_COLUMNS,
-        dst_null= NO_SIGNAL_VALUE
-    )
+    # 入力/出力次元の取得
+    sample_rss, _ = next(iter(source_train_loader))
+    input_dim = sample_rss.shape[1] # RSS特徴の次元
+    output_loc_dim = 2 # X, Y座標 
 
-    Y_columns = y_test.columns
+    # TransLocモデルの初期化
+    z_dim = 16 # ドメイン不変特徴の次元 
+    domain_dim = 1 # ドメインラベルの次元 (バイナリ: Source=0, Target=1)
+    
+    model = TransLoc(input_dim, z_dim, output_loc_dim, domain_dim).to(device)
+    print("TransLoc model initialized.")
+    # print(model) # モデル構造の確認
 
-    print(x_train_o)
-    print(y_train)
+    # 学習の実行
+    # ハイパーパラメータのデフォルト値は論文の「Hyper-parameter Selection」セクションを参照 
+    # lambda_D, lambda_R, lambda_CC のデフォルト値は1 
+    # η (eta_gradient_reversal) のデフォルト値は10 
+    train_transloc(model, source_train_loader, target_train_loader, target_test_loader, data_scalers,
+                   num_epochs=200, # 論文の実験期間は3ヶ月 (長期間) 
+                   lr_fe_lp=0.0002, # Adamの学習率は論文のImageNet実験から参考に (DANN: 0.0002)
+                   lr_g=0.0002,
+                   lr_d=0.0002,
+                   lambda_D=1, lambda_R=1, lambda_CC=1,
+                   epsilon_tri_net=1e-4) # Tri-netのepsilon (非常に小さい量) 
+
+    # モデルの保存 (オプション)
+    torch.save(model.state_dict(), "transloc_model.pth")
+    print("Model saved to transloc_model.pth")
+
+    # テストデータで最終評価
+    model.eval()
+    total_test_distance = 0
+    with torch.no_grad():
+        for test_rss, test_loc in target_test_loader:
+            test_rss, test_loc = test_rss.to(device), test_loc.to(device)
+            z_test = model.feature_extractor(test_rss)
+            predicted_loc_avg, _, _, _ = model.location_predictor(z_test)
+            
+            predicted_loc_unscaled = data_scalers['loc_scaler'].inverse_transform(predicted_loc_avg.cpu().numpy())
+            true_loc_unscaled = data_scalers['loc_scaler'].inverse_transform(test_loc.cpu().numpy())
+
+            distances = np.sqrt(np.sum((predicted_loc_unscaled - true_loc_unscaled)**2, axis=1))
+            total_test_distance += np.sum(distances)
+    
+    avg_test_distance = total_test_distance / len(target_test_loader.dataset)
+    print(f"\nFinal Test Localization Error: {avg_test_distance:.4f} m ")
