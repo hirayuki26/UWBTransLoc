@@ -123,7 +123,7 @@ def create_dataloaders(source_train_path, target_train_path, target_test_path):
 place_name = 'OfficeP2'
 source_train_path = f'./data/{place_name}/csv/{place_name}_1_training.csv'
 target_train_path = f'./data/{place_name}/csv/{place_name}_2_training.csv'
-target_test_path = f'./data/{place_name}/csv/{place_name}_testing.csv'
+target_test_path = f'./data/{place_name}/csv/{place_name}_2_testing.csv'
 
 source_train_loader, target_train_loader, target_test_loader, data_scalers = create_dataloaders(
     source_train_path, target_train_path, target_test_path
