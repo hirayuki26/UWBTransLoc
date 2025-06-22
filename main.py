@@ -9,6 +9,7 @@ from sklearn.preprocessing import MinMaxScaler
 import random
 import copy
 import math
+import matplotlib.pyplot as plt
 
 # デバイス設定
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -380,6 +381,16 @@ def train_transloc(model, source_train_loader, target_train_loader, target_test_
     # 論文ではeta=10がデフォルト 
     eta_gradient_reversal = 10 
 
+    # Loss history lists (追加: 損失履歴を記録するためのリストを初期化)
+    total_loss_d_history = []
+    total_loss_g_adv_history = []
+    total_loss_g_rec_history = []
+    total_loss_lp_history = []
+    total_loss_cc_f_history = []
+    total_loss_cc_p_history = []
+    test_error_history = []
+    test_error_epochs_recorded = []
+
     # 事前学習フェーズ 
     print("--- Pre-training Phase ---")
     pretrain_epochs = 50 # Adjust based on complexity and convergence
@@ -740,6 +751,14 @@ def train_transloc(model, source_train_loader, target_train_loader, target_test_
             optimizer_fe.step()
             optimizer_g.step()
             optimizer_lp.step()
+        
+        # Record epoch losses (変更: 各エポックの損失を履歴リストに追加)
+        total_loss_d_history.append(total_loss_d / num_batches)
+        total_loss_g_adv_history.append(total_loss_g_adv / num_batches)
+        total_loss_g_rec_history.append(total_loss_g_rec / num_batches)
+        total_loss_lp_history.append(total_loss_lp / num_batches)
+        total_loss_cc_f_history.append(total_loss_cc_f / num_batches)
+        total_loss_cc_p_history.append(total_loss_cc_p / num_batches)
 
         # エポックごとの進捗表示
         print(f"Epoch {epoch+1}/{num_epochs}, D_Loss: {total_loss_d / num_batches:.4f}, G_Adv_Loss: {total_loss_g_adv / num_batches:.4f}, "
@@ -764,10 +783,18 @@ def train_transloc(model, source_train_loader, target_train_loader, target_test_
                     total_test_distance += np.sum(distances)
             
             avg_test_distance = total_test_distance / len(target_test_loader.dataset)
+            # テスト誤差と対応するエポックを記録 (追加)
+            test_error_history.append(avg_test_distance)
+            test_error_epochs_recorded.append(epoch + 1)
             print(f"--- Epoch {epoch+1} Test Localization Error: {avg_test_distance:.4f} m --- ")
             model.train() # Set back to train mode
 
     print("Training finished.")
+
+    # 訓練履歴を返す (変更: 戻り値を追加)
+    return (total_loss_d_history, total_loss_g_adv_history, total_loss_g_rec_history,
+            total_loss_lp_history, total_loss_cc_f_history, total_loss_cc_p_history,
+            test_error_history, test_error_epochs_recorded)
 
 
 # --- 実行部分 ---
@@ -777,9 +804,11 @@ if __name__ == "__main__":
     # target_train_path = './data/OfficeP2/csv/OfficeP2_2_training.csv'
     # target_test_path = './data/OfficeP2/csv/OfficeP2_2_testing.csv'
     place_name = 'OfficeP2'
-    source_train_path = f'./data/{place_name}/csv/{place_name}_1_training.csv'
-    target_train_path = f'./data/{place_name}/csv/{place_name}_2_training.csv'
-    target_test_path = f'./data/{place_name}/csv/{place_name}_2_testing.csv'
+    train_fnum = '1'
+    test_fnum = '3'
+    source_train_path = f'./data/{place_name}/csv/{place_name}_{train_fnum}_training.csv'
+    target_train_path = f'./data/{place_name}/csv/{place_name}_{test_fnum}_training.csv'
+    target_test_path = f'./data/{place_name}/csv/{place_name}_{test_fnum}_testing.csv'
 
     source_train_loader, target_train_loader, target_test_loader, data_scalers = create_dataloaders(
         source_train_path, target_train_path, target_test_path
@@ -808,7 +837,10 @@ if __name__ == "__main__":
     # ハイパーパラメータのデフォルト値は論文の「Hyper-parameter Selection」セクションを参照 
     # lambda_D, lambda_R, lambda_CC のデフォルト値は1 
     # η (eta_gradient_reversal) のデフォルト値は10 
-    train_transloc(model, source_train_loader, target_train_loader, target_test_loader, data_scalers,
+    # train_transloc(model, source_train_loader, target_train_loader, target_test_loader, data_scalers, # model評価プロット前
+    loss_d_hist, loss_g_adv_hist, loss_g_rec_hist, loss_lp_hist, \
+    loss_cc_f_hist, loss_cc_p_hist, test_err_hist, test_err_epochs = train_transloc(
+        model, source_train_loader, target_train_loader, target_test_loader, data_scalers,
                    num_epochs=200, # 論文の実験期間は3ヶ月 (長期間) 
                    lr_fe_lp=0.0002, # Adamの学習率は論文のImageNet実験から参考に (DANN: 0.0002)
                    lr_g=0.0002,
@@ -817,7 +849,7 @@ if __name__ == "__main__":
                    epsilon_tri_net=1e-4) # Tri-netのepsilon (非常に小さい量) 
 
     # # モデルの保存 (オプション)
-    torch.save(model.state_dict(), "transloc_model.pth")
+    torch.save(model.state_dict(), f"./output/transloc_model_{place_name}train{train_fnum}test{test_fnum}.pth")
     print("Model saved to transloc_model.pth")
 
     # # テストデータで最終評価
@@ -837,3 +869,38 @@ if __name__ == "__main__":
     
     avg_test_distance = total_test_distance / len(target_test_loader.dataset)
     print(f"\nFinal Test Localization Error: {avg_test_distance:.4f} m ")
+    with open(f"./output/localization_error_test.txt", "a", encoding="utf-8") as f:
+        print(f"\n{place_name}_train{train_fnum}_test{test_fnum}\nFinal Test Localization Error: {avg_test_distance:.4f} m ", file=f)
+
+    # --- プロットコードの追加 --- (追加: 訓練履歴をプロット)
+    epochs_range = range(1, len(loss_d_hist) + 1)
+
+    # Plotting Training Losses
+    plt.figure(figsize=(12, 8))
+    plt.plot(epochs_range, loss_d_hist, label='Discriminator Loss')
+    plt.plot(epochs_range, loss_g_adv_hist, label='Generator Adversarial Loss')
+    plt.plot(epochs_range, loss_g_rec_hist, label='Generator Reconstruction Loss')
+    plt.plot(epochs_range, loss_lp_hist, label='Location Predictor Loss')
+    plt.plot(epochs_range, loss_cc_f_hist, label='Cycle Consistency Feature Loss')
+    plt.plot(epochs_range, loss_cc_p_hist, label='Cycle Consistency Prediction Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss Value')
+    plt.title('TransLoc Training Losses Over Epochs')
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(f'./output/transloc_training_losses_{place_name}train{train_fnum}test{test_fnum}.png')
+    plt.close()
+
+    # Plotting Test Localization Error
+    plt.figure(figsize=(10, 6))
+    plt.plot(test_err_epochs, test_err_hist, marker='o', linestyle='-', color='red')
+    plt.xlabel('Epoch')
+    plt.ylabel('Localization Error (m)')
+    plt.title('TransLoc Test Localization Error Over Epochs')
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(f'./output/transloc_test_error_{place_name}train{train_fnum}test{test_fnum}.png')
+    plt.close()
+
+    print("Plots generated: transloc_training_losses.png and transloc_test_error.png")
