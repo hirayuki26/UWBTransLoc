@@ -274,19 +274,19 @@ class LocationPredictor(nn.Module):
         # R_c (shared module) 
         self.rc_fc1 = nn.Linear(z_dim, 1024)
         self.rc_conv_blk = ConvBlk(in_channels=1, out_channels=16, kernel_size=5, stride=1, padding=2) # 5x5x16
-        self.rc_fc2 = nn.Linear(16 * 16 * 16, 2048) 
+        self.rc_fc2 = nn.Linear(16 * 8 * 8, 2048) 
 
         # R_1, R_2, R_3 (parallel sub-modules) 
         self.r1_conv_blk = ConvBlk(in_channels=32, out_channels=16, kernel_size=5, stride=1, padding=2) 
-        self.r1_fc1 = nn.Linear(16 * 4 * 4, 2048)
+        self.r1_fc1 = nn.Linear(16 * 8 * 8, 2048)
         self.r1_fc2 = nn.Linear(2048, output_loc_dim) # Output (X, Y) 
 
         self.r2_conv_blk = ConvBlk(in_channels=32, out_channels=16, kernel_size=5, stride=1, padding=2)
-        self.r2_fc1 = nn.Linear(16 * 4 * 4, 2048)
+        self.r2_fc1 = nn.Linear(16 * 8 * 8, 2048)
         self.r2_fc2 = nn.Linear(2048, output_loc_dim)
 
         self.r3_conv_blk = ConvBlk(in_channels=32, out_channels=16, kernel_size=5, stride=1, padding=2)
-        self.r3_fc1 = nn.Linear(16 * 4 * 4, 2048)
+        self.r3_fc1 = nn.Linear(16 * 8 * 8, 2048)
         self.r3_fc2 = nn.Linear(2048, output_loc_dim)
 
     def forward(self, z):
@@ -469,14 +469,8 @@ def train_transloc(model, source_train_loader, target_train_loader, target_test_
             source_rss, source_loc = source_rss.to(device), source_loc.to(device)
             target_rss = target_rss.to(device)
 
-            # real_labels = torch.ones(source_rss.size(0), 1).to(device)
-            # fake_labels = torch.zeros(source_rss.size(0), 1).to(device)
-            # そのバッチで処理される最大バッチサイズを決定
-            current_max_batch_size = max(source_rss.size(0), target_rss.size(0))
-
-            # real_labels と fake_labels を現在のバッチサイズに合わせて作成
-            real_labels = torch.ones(current_max_batch_size, 1).to(device)
-            fake_labels = torch.zeros(current_max_batch_size, 1).to(device)
+            real_labels = torch.ones(source_rss.size(0), 1).to(device)
+            fake_labels = torch.zeros(source_rss.size(0), 1).to(device)
             
             # Domain labels
             source_domain_label = torch.zeros(source_rss.size(0), 1).to(device) # d_s = 0
@@ -493,17 +487,9 @@ def train_transloc(model, source_train_loader, target_train_loader, target_test_
 
             # Fake source data (transformed from target to source)
             # Z from target data
-            # z_t = model.feature_extractor(target_rss)
-            # fake_source_rss = model.generator(z_t, source_domain_label[:z_t.size(0)])
-            # d_s_fake, _ = model.discriminator(fake_source_rss.detach()) # Detach to prevent G from updating
-            # loss_ds_fake = criterion_discriminator(d_s_fake, fake_labels[:d_s_fake.size(0)])
-
-            # Fake source data (transformed from target to source)
             z_t = model.feature_extractor(target_rss)
-            # source_domain_label のサイズを z_t のバッチサイズに合わせる
-            current_batch_source_domain_label = torch.zeros(z_t.size(0), 1).to(device)
-            fake_source_rss = model.generator(z_t, current_batch_source_domain_label) # 修正箇所1
-            d_s_fake, _ = model.discriminator(fake_source_rss.detach())
+            fake_source_rss = model.generator(z_t, source_domain_label[:z_t.size(0)])
+            d_s_fake, _ = model.discriminator(fake_source_rss.detach()) # Detach to prevent G from updating
             loss_ds_fake = criterion_discriminator(d_s_fake, fake_labels[:d_s_fake.size(0)])
             
             loss_ds = 0.5 * (loss_ds_real + loss_ds_fake) # Eq 5 (L_Ds) 
@@ -516,17 +502,9 @@ def train_transloc(model, source_train_loader, target_train_loader, target_test_
 
             # Fake target data (transformed from source to target)
             # Z from source data
-            # z_s = model.feature_extractor(source_rss)
-            # fake_target_rss = model.generator(z_s, target_domain_label[:z_s.size(0)])
-            # _, d_t_fake = model.discriminator(fake_target_rss.detach()) # Detach to prevent G from updating
-            # loss_dt_fake = criterion_discriminator(d_t_fake, fake_labels[:d_t_fake.size(0)])
-
-            # Fake target data (transformed from source to target)
             z_s = model.feature_extractor(source_rss)
-            # target_domain_label のサイズを z_s のバッチサイズに合わせる
-            current_batch_target_domain_label = torch.ones(z_s.size(0), 1).to(device)
-            fake_target_rss = model.generator(z_s, current_batch_target_domain_label) # 修正箇所2
-            _, d_t_fake = model.discriminator(fake_target_rss.detach())
+            fake_target_rss = model.generator(z_s, target_domain_label[:z_s.size(0)])
+            _, d_t_fake = model.discriminator(fake_target_rss.detach()) # Detach to prevent G from updating
             loss_dt_fake = criterion_discriminator(d_t_fake, fake_labels[:d_t_fake.size(0)])
 
             loss_dt = 0.5 * (loss_dt_real + loss_dt_fake) # Eq 6 (L_Dt) 
@@ -566,30 +544,14 @@ def train_transloc(model, source_train_loader, target_train_loader, target_test_
             # L_GAN (G) = 0.5 * (D_s(G(Z_t, d_s)) - 1)^2 + 0.5 * (D_t(G(Z_s, d_t)) - 1)^2
             
             # Fake Source (Target -> Source)
-            # z_t_for_g = model.feature_extractor(target_rss)
-            # fake_source_rss_for_g = model.generator(z_t_for_g, source_domain_label[:z_t_for_g.size(0)])
-            # d_s_fake_for_g, _ = model.discriminator(fake_source_rss_for_g)
-            # loss_g_adv_s = criterion_generator_adv(d_s_fake_for_g, real_labels[:d_s_fake_for_g.size(0)])
-
-            # Fake Source (Target -> Source)
             z_t_for_g = model.feature_extractor(target_rss)
-            # source_domain_label のサイズを z_t_for_g のバッチサイズに合わせる
-            current_batch_source_domain_label_for_g = torch.zeros(z_t_for_g.size(0), 1).to(device)
-            fake_source_rss_for_g = model.generator(z_t_for_g, current_batch_source_domain_label_for_g) # 修正箇所3
+            fake_source_rss_for_g = model.generator(z_t_for_g, source_domain_label[:z_t_for_g.size(0)])
             d_s_fake_for_g, _ = model.discriminator(fake_source_rss_for_g)
             loss_g_adv_s = criterion_generator_adv(d_s_fake_for_g, real_labels[:d_s_fake_for_g.size(0)])
 
             # Fake Target (Source -> Target)
-            # z_s_for_g = model.feature_extractor(source_rss)
-            # fake_target_rss_for_g = model.generator(z_s_for_g, target_domain_label[:z_s_for_g.size(0)])
-            # _, d_t_fake_for_g = model.discriminator(fake_target_rss_for_g)
-            # loss_g_adv_t = criterion_generator_adv(d_t_fake_for_g, real_labels[:d_t_fake_for_g.size(0)])
-
-            # Fake Target (Source -> Target)
             z_s_for_g = model.feature_extractor(source_rss)
-            # target_domain_label のサイズを z_s_for_g のバッチサイズに合わせる
-            current_batch_target_domain_label_for_g = torch.ones(z_s_for_g.size(0), 1).to(device)
-            fake_target_rss_for_g = model.generator(z_s_for_g, current_batch_target_domain_label_for_g) # 修正箇所4
+            fake_target_rss_for_g = model.generator(z_s_for_g, target_domain_label[:z_s_for_g.size(0)])
             _, d_t_fake_for_g = model.discriminator(fake_target_rss_for_g)
             loss_g_adv_t = criterion_generator_adv(d_t_fake_for_g, real_labels[:d_t_fake_for_g.size(0)])
 
@@ -790,12 +752,6 @@ if __name__ == "__main__":
     input_dim = sample_rss.shape[1] # RSS特徴の次元
     output_loc_dim = 2 # X, Y座標 
 
-    print(f"Input Dimension (RSS features): {input_dim}")
-    print(f"Output Dimension (Location features): {output_loc_dim}")
-    print(f"Number of samples in source_train: {len(source_train_loader.dataset)}")
-    print(f"Number of samples in target_train: {len(target_train_loader.dataset)}")
-    print(f"Number of samples in target_test: {len(target_test_loader.dataset)}")
-
     # TransLocモデルの初期化
     z_dim = 16 # ドメイン不変特徴の次元 
     domain_dim = 1 # ドメインラベルの次元 (バイナリ: Source=0, Target=1)
@@ -820,7 +776,7 @@ if __name__ == "__main__":
     torch.save(model.state_dict(), "transloc_model.pth")
     print("Model saved to transloc_model.pth")
 
-    # # テストデータで最終評価
+    # テストデータで最終評価
     model.eval()
     total_test_distance = 0
     with torch.no_grad():
