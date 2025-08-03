@@ -394,6 +394,12 @@ def train_transloc(model, source_train_loader, target_train_loader, target_test_
     test_error_history = []
     test_error_epochs_recorded = []
 
+    # New histories for pseudo-label metrics
+    pseudo_label_counts_history = []
+    pseudo_label_consistency_error_history = []
+    # 追加: 擬似ラベルと真のラベルの誤差履歴
+    pseudo_label_true_error_history = [] 
+
     # 事前学習フェーズ 
     print("--- Pre-training Phase ---")
     pretrain_epochs = 50 # Adjust based on complexity and convergence
@@ -454,6 +460,12 @@ def train_transloc(model, source_train_loader, target_train_loader, target_test_
         total_loss_cc_f = 0
         total_loss_cc_p = 0
 
+        # Pseudo-label metrics for current epoch
+        epoch_pseudo_label_counts = {0: 0, 1: 0, 2: 0}
+        epoch_pseudo_label_consistency_errors = []
+        # 追加: 現在のエポックでの擬似ラベルと真のラベルの誤差リスト
+        epoch_pseudo_label_true_errors = [] 
+
         # データローダーをイテレート
         # target_train_loader は unlabeled data (x_t) 
         # source_train_loader は labeled data (x_s, y_s) 
@@ -475,13 +487,16 @@ def train_transloc(model, source_train_loader, target_train_loader, target_test_
                 source_rss, source_loc = next(source_iter)
 
             try:
-                target_rss, _ = next(target_iter) # Target data is unlabeled
+                # target_rss, _ = next(target_iter) # Target data is unlabeled
+                target_rss, target_loc = next(target_iter)
             except StopIteration:
                 target_iter = iter(target_train_loader)
-                target_rss, _ = next(target_iter)
+                # target_rss, _ = next(target_iter)
+                target_rss, target_loc = next(target_iter)
 
             source_rss, source_loc = source_rss.to(device), source_loc.to(device)
-            target_rss = target_rss.to(device)
+            # target_rss = target_rss.to(device)
+            target_rss, target_loc = target_rss.to(device), target_loc.to(device)
 
             # real_labels = torch.ones(source_rss.size(0), 1).to(device)
             # fake_labels = torch.zeros(source_rss.size(0), 1).to(device)
@@ -649,7 +664,6 @@ def train_transloc(model, source_train_loader, target_train_loader, target_test_
             # Re-enable dropout for next training iteration
             model.location_predictor.train()
 
-
             for idx in range(target_rss.size(0)):
                 # Same Prediction 
                 # Compare two of the three sub-modules (e.g., R2 and R3 for R1's pseudo-label)
@@ -669,9 +683,21 @@ def train_transloc(model, source_train_loader, target_train_loader, target_test_
                                 is_stable = False
                                 break
                         if is_stable:
+                            # print("R1: add pseudo")
                             pseudo_label = (r2_pred_no_dropout[idx] + r3_pred_no_dropout[idx]) / 2 # Eq 11 
                             pseudo_labeled_target_locs.append((z_t_lp_raw[idx], pseudo_label, 0)) # Store (z, pseudo_y, sub_module_idx for R1)
                             valid_pseudo_labels_count += 1
+
+                            epoch_pseudo_label_counts[0] += 1
+                            consistency_error = torch.norm(pseudo_label - r2_pred_no_dropout[idx]) + \
+                                                torch.norm(pseudo_label - r3_pred_no_dropout[idx])
+                            epoch_pseudo_label_consistency_errors.append(consistency_error.item())
+                            
+                            # 追加: 擬似ラベルと真のラベルの誤差を計算 (アンノーマライズしてから)
+                            pseudo_label_unscaled = data_scalers['loc_scaler'].inverse_transform(pseudo_label.cpu().numpy().reshape(1, -1)).flatten()
+                            true_loc_unscaled = data_scalers['loc_scaler'].inverse_transform(target_loc[idx].cpu().numpy().reshape(1, -1)).flatten()
+                            true_error = np.sqrt(np.sum((pseudo_label_unscaled - true_loc_unscaled)**2))
+                            epoch_pseudo_label_true_errors.append(true_error) # この行を追加
 
                 # R2's pseudo-label is from R1, R3
                 if torch.norm(r1_pred_no_dropout[idx] - r3_pred_no_dropout[idx]) < epsilon_loc:
@@ -684,9 +710,21 @@ def train_transloc(model, source_train_loader, target_train_loader, target_test_
                                 is_stable = False
                                 break
                         if is_stable:
+                            # print("R2: add pseudo")
                             pseudo_label = (r1_pred_no_dropout[idx] + r3_pred_no_dropout[idx]) / 2
                             pseudo_labeled_target_locs.append((z_t_lp_raw[idx], pseudo_label, 1)) # sub_module_idx for R2
                             valid_pseudo_labels_count += 1
+
+                            epoch_pseudo_label_counts[1] += 1
+                            consistency_error = torch.norm(pseudo_label - r1_pred_no_dropout[idx]) + \
+                                                torch.norm(pseudo_label - r3_pred_no_dropout[idx])
+                            epoch_pseudo_label_consistency_errors.append(consistency_error.item())
+                            
+                            # 追加: 擬似ラベルと真のラベルの誤差を計算
+                            pseudo_label_unscaled = data_scalers['loc_scaler'].inverse_transform(pseudo_label.cpu().numpy().reshape(1, -1)).flatten()
+                            true_loc_unscaled = data_scalers['loc_scaler'].inverse_transform(target_loc[idx].cpu().numpy().reshape(1, -1)).flatten()
+                            true_error = np.sqrt(np.sum((pseudo_label_unscaled - true_loc_unscaled)**2))
+                            epoch_pseudo_label_true_errors.append(true_error) # この行を追加
 
                 # R3's pseudo-label is from R1, R2
                 if torch.norm(r1_pred_no_dropout[idx] - r2_pred_no_dropout[idx]) < epsilon_loc:
@@ -699,9 +737,21 @@ def train_transloc(model, source_train_loader, target_train_loader, target_test_
                                 is_stable = False
                                 break
                         if is_stable:
+                            # print("R3: add pseudo")
                             pseudo_label = (r1_pred_no_dropout[idx] + r2_pred_no_dropout[idx]) / 2
                             pseudo_labeled_target_locs.append((z_t_lp_raw[idx], pseudo_label, 2)) # sub_module_idx for R3
                             valid_pseudo_labels_count += 1
+
+                            epoch_pseudo_label_counts[2] += 1
+                            consistency_error = torch.norm(pseudo_label - r1_pred_no_dropout[idx]) + \
+                                                torch.norm(pseudo_label - r2_pred_no_dropout[idx])
+                            epoch_pseudo_label_consistency_errors.append(consistency_error.item())
+                            
+                            # 追加: 擬似ラベルと真のラベルの誤差を計算
+                            pseudo_label_unscaled = data_scalers['loc_scaler'].inverse_transform(pseudo_label.cpu().numpy().reshape(1, -1)).flatten()
+                            true_loc_unscaled = data_scalers['loc_scaler'].inverse_transform(target_loc[idx].cpu().numpy().reshape(1, -1)).flatten()
+                            true_error = np.sqrt(np.sum((pseudo_label_unscaled - true_loc_unscaled)**2))
+                            epoch_pseudo_label_true_errors.append(true_error) # この行を追加
 
             loss_rt = 0
             if valid_pseudo_labels_count > 0:
@@ -764,8 +814,24 @@ def train_transloc(model, source_train_loader, target_train_loader, target_test_
         total_loss_cc_p_history.append(total_loss_cc_p / num_batches)
 
         # エポックごとの進捗表示
+        # print(f"Epoch {epoch+1}/{num_epochs}, D_Loss: {total_loss_d / num_batches:.4f}, G_Adv_Loss: {total_loss_g_adv / num_batches:.4f}, "
+        #       f"LP_Loss: {total_loss_lp / num_batches:.4f}, CC_F_Loss: {total_loss_cc_f / num_batches:.4f}, CC_P_Loss: {total_loss_cc_p / num_batches:.4f}")
+
+        # エポック終了時、履歴リストに追加（for i in range(num_batches): ループの直後）
+        total_pseudo_labels = sum(epoch_pseudo_label_counts.values())
+        avg_pseudo_label_consistency_error = sum(epoch_pseudo_label_consistency_errors) / len(epoch_pseudo_label_consistency_errors) if len(epoch_pseudo_label_consistency_errors) > 0 else 0
+        # 追加: 擬似ラベルと真のラベルの平均誤差を計算
+        avg_pseudo_label_true_error = sum(epoch_pseudo_label_true_errors) / len(epoch_pseudo_label_true_errors) if len(epoch_pseudo_label_true_errors) > 0 else 0 
+
+        pseudo_label_counts_history.append(total_pseudo_labels)
+        pseudo_label_consistency_error_history.append(avg_pseudo_label_consistency_error)
+        # 追加: 履歴リストに平均誤差を追加
+        pseudo_label_true_error_history.append(avg_pseudo_label_true_error) 
+
         print(f"Epoch {epoch+1}/{num_epochs}, D_Loss: {total_loss_d / num_batches:.4f}, G_Adv_Loss: {total_loss_g_adv / num_batches:.4f}, "
-              f"LP_Loss: {total_loss_lp / num_batches:.4f}, CC_F_Loss: {total_loss_cc_f / num_batches:.4f}, CC_P_Loss: {total_loss_cc_p / num_batches:.4f}")
+              f"LP_Loss: {total_loss_lp / num_batches:.4f}, CC_F_Loss: {total_loss_cc_f / num_batches:.4f}, CC_P_Loss: {total_loss_cc_p / num_batches:.4f}, "
+              f"Pseudo-Labels: {total_pseudo_labels}, Pseudo-Label Consistency Error: {avg_pseudo_label_consistency_error:.4f}, "
+              f"Pseudo-Label True Error: {avg_pseudo_label_true_error:.4f}") # print文を修正
 
         # テストセットでの評価 (測位精度)
         if (epoch + 1) % 10 == 0: # 10エポックごとに評価
@@ -794,10 +860,17 @@ def train_transloc(model, source_train_loader, target_train_loader, target_test_
 
     print("Training finished.")
 
-    # 訓練履歴を返す (変更: 戻り値を追加)
+    # # 訓練履歴を返す (変更: 戻り値を追加)
+    # return (total_loss_d_history, total_loss_g_adv_history, total_loss_g_rec_history,
+    #         total_loss_lp_history, total_loss_cc_f_history, total_loss_cc_p_history,
+    #         test_error_history, test_error_epochs_recorded)
+
+    # train_transloc 関数の return 文を修正
     return (total_loss_d_history, total_loss_g_adv_history, total_loss_g_rec_history,
             total_loss_lp_history, total_loss_cc_f_history, total_loss_cc_p_history,
-            test_error_history, test_error_epochs_recorded)
+            test_error_history, test_error_epochs_recorded,
+            pseudo_label_counts_history, pseudo_label_consistency_error_history,
+            pseudo_label_true_error_history) # この行を追加
 
 
 # --- 実行部分 ---
@@ -843,15 +916,26 @@ if __name__ == "__main__":
     # lambda_D, lambda_R, lambda_CC のデフォルト値は1 
     # η (eta_gradient_reversal) のデフォルト値は10 
     # train_transloc(model, source_train_loader, target_train_loader, target_test_loader, data_scalers, # model評価プロット前
+    # loss_d_hist, loss_g_adv_hist, loss_g_rec_hist, loss_lp_hist, \
+    # loss_cc_f_hist, loss_cc_p_hist, test_err_hist, test_err_epochs = train_transloc(
+    #     model, source_train_loader, target_train_loader, target_test_loader, data_scalers,
+    #                num_epochs=50,#200, # 論文の実験期間は3ヶ月 (長期間) 
+    #                lr_fe_lp=0.0002, # Adamの学習率は論文のImageNet実験から参考に (DANN: 0.0002)
+    #                lr_g=0.0002,
+    #                lr_d=0.0002,
+    #                lambda_D=1, lambda_R=1, lambda_CC=1,
+    #                epsilon_tri_net=1e-4) # Tri-netのepsilon (非常に小さい量) 
     loss_d_hist, loss_g_adv_hist, loss_g_rec_hist, loss_lp_hist, \
-    loss_cc_f_hist, loss_cc_p_hist, test_err_hist, test_err_epochs = train_transloc(
+    loss_cc_f_hist, loss_cc_p_hist, test_err_hist, test_err_epochs, \
+    pseudo_label_counts_hist, pseudo_label_consistency_err_hist, \
+    pseudo_label_true_error_hist = train_transloc( # この行を修正
         model, source_train_loader, target_train_loader, target_test_loader, data_scalers,
-                   num_epochs=50,#200, # 論文の実験期間は3ヶ月 (長期間) 
-                   lr_fe_lp=0.0002, # Adamの学習率は論文のImageNet実験から参考に (DANN: 0.0002)
-                   lr_g=0.0002,
-                   lr_d=0.0002,
-                   lambda_D=1, lambda_R=1, lambda_CC=1,
-                   epsilon_tri_net=1e-4) # Tri-netのepsilon (非常に小さい量) 
+                    num_epochs=50, #200,
+                    lr_fe_lp=0.0002,
+                    lr_g=0.0002,
+                    lr_d=0.0002,
+                    lambda_D=1, lambda_R=1, lambda_CC=1,
+                    epsilon_tri_net=1e-2)
 
     # # モデルの保存 (オプション)
     torch.save(model.state_dict(), f"./output/transloc_model_train_{train_scene}test_{test_scene}.pth")
@@ -993,3 +1077,48 @@ if __name__ == "__main__":
     plt.close()
 
     print("Plots generated: transloc_training_losses.png and transloc_test_error.png")
+
+
+    # Plotting Pseudo-Label True Error (このブロックを追加)
+    plt.figure(figsize=(10, 6))
+    plt.plot(epochs_range, pseudo_label_true_error_hist, marker='o', linestyle='-', color='purple')
+    plt.xlabel('Epoch')
+    plt.ylabel('Average Pseudo-Label True Error (m)')
+    plt.title('Average Pseudo-Label True Error Per Epoch on Target Training Data')
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(f'./output/transloc_pseudo_label_true_error_train{train_scene}test{test_scene}.png')
+    plt.close()
+
+    # Writing pseudo-label metrics to text file:
+    test_error_map = {test_err_epochs[i]: test_err_hist[i] for i in range(len(test_err_epochs))}
+
+    with open(f"./output/pseudo_label_metrics.txt", "a", encoding="utf-8") as f:
+        f.write(f"train{train_scene}, test{test_scene}\n")
+        f.write(f"Epoch,Total Pseudo-Labels,Avg Pseudo-Label Consistency Error,Avg Pseudo-Label True Error,Test Localization Error (m)\n") # ヘッダー修正
+        for i in range(len(epochs_range)):
+            epoch = epochs_range[i]
+            pseudo_count = pseudo_label_counts_hist[i]
+            consistency_err = pseudo_label_consistency_err_hist[i]
+            true_err = pseudo_label_true_error_hist[i] # 新しいエラー値
+            test_err = test_error_map.get(epoch)
+            
+            test_err_str = f"{test_err:.4f}" if test_err is not None else "N/A"
+            f.write(f"{epoch},{pseudo_count},{consistency_err:.4f},{true_err:.4f},{test_err_str}\n") # 出力フォーマット修正
+
+
+    print(f"Plots generated: ..., /transloc_pseudo_label_true_error_train{train_scene}test{test_scene}.png") # print文修正
+    print(f"Pseudo-label metrics saved to /pseudo_label_metrics_train{train_scene}test{test_scene}.txt")
+
+    # Plotting Pseudo-Label Counts
+    plt.figure(figsize=(10, 6))
+    plt.plot(epochs_range, pseudo_label_counts_hist, marker='o', linestyle='-', color='blue')
+    plt.xlabel('Epoch')
+    plt.ylabel('Number of Pseudo-Labels Generated')
+    plt.title('Total Pseudo-Labels Generated Per Epoch')
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(f'./output/transloc_pseudo_label_counts_train{train_scene}test{test_scene}.png')
+    plt.close()
+
+    print(f"Pseudo-label counts plot saved to /transloc_pseudo_label_counts_train{train_scene}test{test_scene}.png")

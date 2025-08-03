@@ -800,15 +800,17 @@ def train_transloc(model, source_train_loader, target_train_loader, target_test_
 # --- 実行部分 ---
 if __name__ == "__main__":
     # データローダーの作成
-    # source_train_path = './data/OfficeP2/csv/OfficeP2_1_training.csv'
-    # target_train_path = './data/OfficeP2/csv/OfficeP2_2_training.csv'
-    # target_test_path = './data/OfficeP2/csv/OfficeP2_2_testing.csv'
-    place_name = 'OfficeP2'
-    train_fnum = '1'
-    test_fnum = '3'
-    source_train_path = f'./data/{place_name}/csv/{place_name}_{train_fnum}_training.csv'
-    target_train_path = f'./data/{place_name}/csv/{place_name}_{test_fnum}_training.csv'
-    target_test_path = f'./data/{place_name}/csv/{place_name}_{test_fnum}_testing.csv'
+    # place_name = 'OfficeP2'
+    # train_fnum = '1'
+    # test_fnum = '3'
+    # source_train_path = f'./data/{place_name}/csv/{place_name}_{train_fnum}_training.csv'
+    # target_train_path = f'./data/{place_name}/csv/{place_name}_{test_fnum}_training.csv'
+    # target_test_path = f'./data/{place_name}/csv/{place_name}_{test_fnum}_testing.csv'
+    train_scene = 'non_obst'
+    test_scene = 'wall'
+    source_train_path = f'./data/uwb/processed_uwb_full_features_data_{train_scene}.csv'
+    target_train_path = f'./data/uwb/processed_uwb_full_features_data_{test_scene}_train_split.csv'
+    target_test_path = f'./data/uwb/processed_uwb_full_features_data_{test_scene}_test_split.csv'
 
     source_train_loader, target_train_loader, target_test_loader, data_scalers = create_dataloaders(
         source_train_path, target_train_path, target_test_path
@@ -841,7 +843,7 @@ if __name__ == "__main__":
     loss_d_hist, loss_g_adv_hist, loss_g_rec_hist, loss_lp_hist, \
     loss_cc_f_hist, loss_cc_p_hist, test_err_hist, test_err_epochs = train_transloc(
         model, source_train_loader, target_train_loader, target_test_loader, data_scalers,
-                   num_epochs=200, # 論文の実験期間は3ヶ月 (長期間) 
+                   num_epochs=50,#200, # 論文の実験期間は3ヶ月 (長期間) 
                    lr_fe_lp=0.0002, # Adamの学習率は論文のImageNet実験から参考に (DANN: 0.0002)
                    lr_g=0.0002,
                    lr_d=0.0002,
@@ -849,12 +851,14 @@ if __name__ == "__main__":
                    epsilon_tri_net=1e-4) # Tri-netのepsilon (非常に小さい量) 
 
     # # モデルの保存 (オプション)
-    torch.save(model.state_dict(), f"./output/transloc_model_{place_name}train{train_fnum}test{test_fnum}.pth")
+    torch.save(model.state_dict(), f"./output/transloc_model_train_{train_scene}test_{test_scene}.pth")
     print("Model saved to transloc_model.pth")
 
     # # テストデータで最終評価
     model.eval()
     total_test_distance = 0
+    all_true_locs = []
+    all_predicted_locs = []
     with torch.no_grad():
         for test_rss, test_loc in target_test_loader:
             test_rss, test_loc = test_rss.to(device), test_loc.to(device)
@@ -866,11 +870,93 @@ if __name__ == "__main__":
 
             distances = np.sqrt(np.sum((predicted_loc_unscaled - true_loc_unscaled)**2, axis=1))
             total_test_distance += np.sum(distances)
+
+            all_true_locs.extend(true_loc_unscaled)
+            all_predicted_locs.extend(predicted_loc_unscaled)
     
     avg_test_distance = total_test_distance / len(target_test_loader.dataset)
-    print(f"\nFinal Test Localization Error: {avg_test_distance:.4f} m ")
+    # print(f"\nFinal Test Localization Error: {avg_test_distance:.4f} m ")
+    print(f"\nFinal Test Localization Error: {avg_test_distance} m ")
     with open(f"./output/localization_error_test.txt", "a", encoding="utf-8") as f:
-        print(f"\n{place_name}_train{train_fnum}_test{test_fnum}\nFinal Test Localization Error: {avg_test_distance:.4f} m ", file=f)
+        # print(f"\ntrain_{train_scene}_test_{test_scene}\nFinal Test Localization Error: {avg_test_distance:.4f} m ", file=f)
+        print(f"\ntrain_{train_scene}_test_{test_scene}\nFinal Test Localization Error: {avg_test_distance} m ", file=f)
+
+    # all_true_locs = np.array(all_true_locs)
+    # all_predicted_locs = np.array(all_predicted_locs)
+
+    # plt.figure(figsize=(10, 8))
+    # plt.scatter(all_true_locs[:, 0], all_true_locs[:, 1], c='blue', marker='x', label='True Locations', alpha=0.7)
+    # plt.scatter(all_predicted_locs[:, 0], all_predicted_locs[:, 1], c='red', marker='o', label='Predicted Locations', alpha=0.7)
+
+    # # 真の位置と予測位置を結ぶ線を描画 (誤差ベクトルの可視化)
+    # for i in range(len(all_true_locs)):
+    #     plt.plot([all_true_locs[i, 0], all_predicted_locs[i, 0]], 
+    #              [all_true_locs[i, 1], all_predicted_locs[i, 1]], 
+    #              'k-', linewidth=0.5, alpha=0.4) # 黒い線
+
+    # plt.xlabel('X Coordinate (m)')
+    # plt.ylabel('Y Coordinate (m)')
+    # plt.title(f'Localization Results: True vs. Predicted Locations (Test Scene: {test_scene})')
+    # plt.legend()
+    # plt.grid(True)
+    # plt.gca().set_aspect('equal', adjustable='box') # アスペクト比を等しくして、歪みをなくす
+    # plt.tight_layout()
+    # plt.savefig(f'./output/localization_results_plot_train_{train_scene}_test_{test_scene}.png')
+    # plt.close()
+
+    # print(f"Localization results plot generated: localization_results_plot_train_{train_scene}_test_{test_scene}.png")
+
+    # --- 測位結果のプロット (平均プロット点ごとに表示) ---
+    print("\nPlotting final localization results with average predicted points...")
+    
+    all_true_locs = np.array(all_true_locs)
+    all_predicted_locs = np.array(all_predicted_locs)
+
+    # ユニークな真の位置とその予測位置をグループ化
+    # Key: tuple(true_x, true_y), Value: list of [pred_x, pred_y]
+    grouped_predictions = {}
+    for i in range(len(all_true_locs)):
+        # NumPy配列を辞書のキーとして使うためにタプルに変換
+        true_loc_tuple = tuple(all_true_locs[i]) 
+        if true_loc_tuple not in grouped_predictions:
+            grouped_predictions[true_loc_tuple] = []
+        grouped_predictions[true_loc_tuple].append(all_predicted_locs[i])
+
+    # 各ユニークな真の位置に対応する平均予測位置を計算
+    unique_true_locs_avg = []
+    avg_predicted_locs = []
+    for true_loc_tuple, pred_locs_list in grouped_predictions.items():
+        unique_true_locs_avg.append(list(true_loc_tuple)) # リストに戻す
+        avg_pred_for_this_true_loc = np.mean(pred_locs_list, axis=0)
+        avg_predicted_locs.append(avg_pred_for_this_true_loc)
+
+    unique_true_locs_avg = np.array(unique_true_locs_avg)
+    avg_predicted_locs = np.array(avg_predicted_locs)
+
+    plt.figure(figsize=(10, 8))
+    # ユニークな真の位置をプロット (大きめのマーカー)
+    plt.scatter(unique_true_locs_avg[:, 0], unique_true_locs_avg[:, 1], 
+                c='blue', marker='o', s=100, label='True Locations (Unique Points)', alpha=0.9)
+    # 平均予測位置をプロット (大きめのマーカー)
+    plt.scatter(avg_predicted_locs[:, 0], avg_predicted_locs[:, 1], 
+                c='red', marker='x', s=100, label='Average Predicted Locations', alpha=0.9)
+
+    # 各真の位置と平均予測位置を結ぶ線を描画 (誤差ベクトル)
+    for i in range(len(unique_true_locs_avg)):
+        plt.plot([unique_true_locs_avg[i, 0], avg_predicted_locs[i, 0]],
+                 [unique_true_locs_avg[i, 1], avg_predicted_locs[i, 1]],
+                 'k-', linewidth=1.0, alpha=0.6) # 黒線、太め、半透明
+
+    plt.xlabel('X Coordinate (m)')
+    plt.ylabel('Y Coordinate (m)')
+    plt.title(f'Final Localization Results: True vs. Average Predicted (Test Scene: {test_scene})')
+    plt.legend()
+    plt.grid(True)
+    plt.gca().set_aspect('equal', adjustable='box') # アスペクト比を等しくして、歪みをなくす
+    plt.tight_layout()
+    plt.savefig(f'./output/final_localization_avg_plot_train_{train_scene}_test_{test_scene}.png')
+    plt.close()
+    print(f"Final localization average plot generated: final_localization_avg_plot_train_{train_scene}_test_{test_scene}.png")
 
     # --- プロットコードの追加 --- (追加: 訓練履歴をプロット)
     epochs_range = range(1, len(loss_d_hist) + 1)
@@ -889,7 +975,7 @@ if __name__ == "__main__":
     plt.legend()
     plt.grid(True)
     plt.tight_layout()
-    plt.savefig(f'./output/transloc_training_losses_{place_name}train{train_fnum}test{test_fnum}.png')
+    plt.savefig(f'./output/transloc_training_losses_train_{train_scene}_test_{test_scene}.png')
     plt.close()
 
     # Plotting Test Localization Error
@@ -900,7 +986,7 @@ if __name__ == "__main__":
     plt.title('TransLoc Test Localization Error Over Epochs')
     plt.grid(True)
     plt.tight_layout()
-    plt.savefig(f'./output/transloc_test_error_{place_name}train{train_fnum}test{test_fnum}.png')
+    plt.savefig(f'./output/transloc_test_error_train_{train_scene}_test_{test_scene}.png')
     plt.close()
 
     print("Plots generated: transloc_training_losses.png and transloc_test_error.png")
