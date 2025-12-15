@@ -67,12 +67,14 @@ def create_dataloaders_for_localization(source_train_path, test_path):
     
     all_rss_cols = sorted(list(all_ap_cols_set)) # APの列名をソートして固定順にする
 
+    rsl_only_cols = [col for col in all_rss_cols if col.endswith('_rng_rng')]
+
     # 各データセットを整形する (AP列の統一と欠損値の埋め合わせ)
     source_train_aligned = align_dataframe_columns(source_train_raw.copy(), all_rss_cols + loc_cols)
     test_aligned = align_dataframe_columns(test_raw.copy(), all_rss_cols + loc_cols)
 
     # スケーリングのためのデータ結合 (Source Train と Test のみ)
-    all_rss_data = pd.concat([source_train_aligned[all_rss_cols], test_aligned[all_rss_cols]])
+    all_rss_data = pd.concat([source_train_aligned[rsl_only_cols], test_aligned[rsl_only_cols]])
     all_loc_data = pd.concat([source_train_aligned[loc_cols], test_aligned[loc_cols]])
 
     # スケーラー初期化
@@ -88,8 +90,8 @@ def create_dataloaders_for_localization(source_train_path, test_path):
     loc_transform = lambda y: loc_scaler.transform(y.reshape(1, -1)).flatten()
 
     # データセット作成
-    source_train_dataset = WiFiDataset(source_train_aligned, all_rss_cols, loc_cols, transform=rss_transform, target_transform=loc_transform)
-    test_dataset = WiFiDataset(test_aligned, all_rss_cols, loc_cols, transform=rss_transform, target_transform=loc_transform)
+    source_train_dataset = WiFiDataset(source_train_aligned, rsl_only_cols, loc_cols, transform=rss_transform, target_transform=loc_transform)
+    test_dataset = WiFiDataset(test_aligned, rsl_only_cols, loc_cols, transform=rss_transform, target_transform=loc_transform)
 
     # データローダー作成
     batch_size = 64
@@ -99,7 +101,7 @@ def create_dataloaders_for_localization(source_train_path, test_path):
     data_scalers = {
         'rss_scaler': rss_scaler,
         'loc_scaler': loc_scaler,
-        'rss_cols': all_rss_cols,
+        'rss_cols': rsl_only_cols,
         'loc_cols': loc_cols
     }
 
@@ -277,10 +279,10 @@ if __name__ == "__main__":
     # テストには、ラベルのないターゲットドメインのRSSデータ（ただし、評価のために真のラベルは必要）
     # 元のファイルパスを使用する代わりに、train_sceneとtest_sceneを使用
     # date = '20251030'
-    train_date = '20251022'
-    test_date = '20251022'
-    train_scene = 'non_obst'#'half_wall_A' # Source Domain (ラベルありデータ)
-    test_scene = 'non_obst'#'half_wall_A'#'non_obst'#'1_lounges_whiteboard_A'#'wall'      # Test Data (ラベルあり、評価用)
+    train_date = '20251214'#'20251030'
+    test_date = '20251214'
+    train_scene = '5Anchors_1Tag_aluminu4_whiteboard_A'#'1805NLOS_Aluminu_foilW'#'non_obst'#'Tripod_aluminum_foil_whiteboard_A'#'non_obst'#'wall_A' # Source Domain (ラベルありデータ)
+    test_scene = '5Anchors_1Tag_aluminu4_whiteboard_A'#'1805NLOS_Aluminu_foilW'#'Aluminum_foilW_A_35'#'Tripod_aluminum_foil_whiteboard_A'#'half_wall_A'#'non_obst'#'1_lounges_whiteboard_A'#'wall'      # Test Data (ラベルあり、評価用)
 
     # source_train_path = f'./data/uwb/processed_uwb_full_features_data_{train_scene}_train_split.csv'
     # source_train_path = f'./data/uwb/{date}/processed_uwb_full_features_data_{train_scene}_train_split.csv'
@@ -325,7 +327,7 @@ if __name__ == "__main__":
     print(f"Model saved to {model_save_path}")
 
     # 最終評価結果の保存
-    final_error_file_path = os.path.join(output_dir, f"localization_error_result_localize.txt")
+    final_error_file_path = os.path.join(output_dir, f"localization_error_result_localize_rsl.txt")
     with open(final_error_file_path, "a", encoding="utf-8") as f:
         final_error = test_err_hist[-1] if test_err_hist else float('nan')
         f.write(f"train_{train_scene}_test_{test_scene}\nFinal Test Localization Error: {final_error:.4f} m\n")
@@ -393,7 +395,7 @@ if __name__ == "__main__":
     plt.gca().set_aspect('equal', adjustable='box')
     plt.tight_layout()
     # plot_save_path_avg = os.path.join(output_dir, f'final_localization_avg_plot_train_{train_scene}_test_{test_scene}_localize.png')
-    plot_save_path_avg = os.path.join(output_dir, f'final_localization_avg_plot_train_{train_scene}_{train_date}_test_{test_scene}_{test_date}_localize.png')
+    plot_save_path_avg = os.path.join(output_dir, f'final_localization_avg_plot_train_{train_scene}_{train_date}_test_{test_scene}_{test_date}_localize_rsl.png')
     plt.savefig(plot_save_path_avg)
     plt.close()
     print(f"Final localization average plot generated: {plot_save_path_avg}")
@@ -406,7 +408,7 @@ if __name__ == "__main__":
     plt.title(f'Localization Error Over Epochs (Train:{train_scene}, Test:{test_scene})')
     plt.grid(True)
     plt.tight_layout()
-    plot_save_path_err = os.path.join(output_dir, f'localization_error_plot_train_{train_scene}_test_{test_scene}_localize.png')
+    plot_save_path_err = os.path.join(output_dir, f'localization_error_plot_train_{train_scene}_test_{test_scene}_localize_rsl.png')
     plt.savefig(plot_save_path_err)
     plt.close()
     print(f"Error plot generated: {plot_save_path_err}")
