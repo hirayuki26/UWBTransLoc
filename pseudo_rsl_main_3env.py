@@ -59,19 +59,29 @@ def align_dataframe_columns(df, target_cols, fill_value=NO_SIGNAL_VALUE):
     # target_colsの順序に並べ替える (重要)
     return df[target_cols]
 
-def create_dataloaders(source_train_path, target_train_path, target_test_path):
+def create_dataloaders(source_train_path, target_train_path, target_test_path, e1_pseudo_path):
     loc_cols = QUANTITATIVE_COLUMNS
 
     # 1. 全てのデータファイルを読み込み、全てのAP列名を収集する
     source_train_raw = pd.read_csv(source_train_path)
     target_train_raw = pd.read_csv(target_train_path)
     target_test_raw = pd.read_csv(target_test_path)
+    e1_pseudo_raw = pd.read_csv(e1_pseudo_path)
+
+    # 擬似ラベルの位置座標カラム名を設定
+    pseudo_loc_cols = [f'pseudo_{c}' for c in loc_cols] # ['pseudo_x', 'pseudo_y']
 
     # 全てのデータフレームから位置情報列を除くすべての列名（APのMACアドレス）を収集
     all_ap_cols_set = set()
     for df in [source_train_raw, target_train_raw, target_test_raw]:
         current_ap_cols = [col for col in df.columns if col not in loc_cols]
         all_ap_cols_set.update(current_ap_cols)
+
+    # E1 データ (擬似ラベル列 'pseudo_x', 'pseudo_y' を除く)
+    # E1には'x', 'y'は含まれないと仮定するが、念のため両方除外しても良い
+    e1_loc_columns_to_exclude = loc_cols + pseudo_loc_cols
+    current_e1_ap_cols = [col for col in e1_pseudo_raw.columns if col not in e1_loc_columns_to_exclude]
+    all_ap_cols_set.update(current_e1_ap_cols)
     
     all_rss_cols = sorted(list(all_ap_cols_set)) # APの列名をソートして固定順にする (重要)
 
@@ -82,19 +92,26 @@ def create_dataloaders(source_train_path, target_train_path, target_test_path):
     target_train_aligned = align_dataframe_columns(target_train_raw.copy(), all_rss_cols + loc_cols)
     target_test_aligned = align_dataframe_columns(target_test_raw.copy(), all_rss_cols + loc_cols)
 
+    # 【追加: E1 データの整形とリネーム】
+    e1_pseudo_aligned = align_dataframe_columns(e1_pseudo_raw.copy(), all_rss_cols + pseudo_loc_cols)
+    # 擬似ラベル列を真のラベル列名 ('x', 'y') にリネームしてE0と結合可能にする
+    e1_pseudo_aligned = e1_pseudo_aligned.rename(columns={f'pseudo_{c}': c for c in loc_cols})
+
     # Load data for scaling (整形後のデータを使用)
     # Concatenate all RSS data for a comprehensive scaling range
     all_rss_data = pd.concat([
         source_train_aligned[rsl_only_cols],
         target_train_aligned[rsl_only_cols],
-        target_test_aligned[rsl_only_cols]
+        target_test_aligned[rsl_only_cols],
+        e1_pseudo_aligned[rsl_only_cols]
     ])
     
     # Concatenate all location data for scaling
     all_loc_data = pd.concat([
         source_train_aligned[loc_cols],
         target_train_aligned[loc_cols],
-        target_test_aligned[loc_cols]
+        target_test_aligned[loc_cols],
+        e1_pseudo_aligned[loc_cols]
     ])
 
     # Initialize scalers
@@ -111,14 +128,24 @@ def create_dataloaders(source_train_path, target_train_path, target_test_path):
     rss_transform = lambda x: rss_scaler.transform(x.reshape(1, -1)).flatten()
     loc_transform = lambda y: loc_scaler.transform(y.reshape(1, -1)).flatten()
 
+    # 3. E0とE1を結合して新しいソースデータを作成
+    combined_source_df = pd.concat([
+        source_train_aligned[rsl_only_cols + loc_cols], # E0 (真のラベル)
+        e1_pseudo_aligned[rsl_only_cols + loc_cols]     # E1 (擬似ラベル)
+    ]).reset_index(drop=True) # インデックスをリセットして結合
+
     # Create datasets (整形済みのDataFrameを渡す)
-    source_train_dataset = WiFiDataset(source_train_aligned, rsl_only_cols, loc_cols, transform=rss_transform, target_transform=loc_transform)
+    # Create datasets (E0とE1を結合したデータフレームを渡す)
+    combined_source_dataset = WiFiDataset(combined_source_df, rsl_only_cols, loc_cols, transform=rss_transform, target_transform=loc_transform) # 【変更: 新しいソースデータセット】
+    # source_train_dataset = WiFiDataset(source_train_aligned, rsl_only_cols, loc_cols, transform=rss_transform, target_transform=loc_transform)
     target_train_dataset = WiFiDataset(target_train_aligned, rsl_only_cols, loc_cols, transform=rss_transform, target_transform=loc_transform)
     target_test_dataset = WiFiDataset(target_test_aligned, rsl_only_cols, loc_cols, transform=rss_transform, target_transform=loc_transform)
 
     # Create dataloaders
     batch_size = 64 # You can adjust this
-    source_train_loader = DataLoader(source_train_dataset, batch_size=batch_size, shuffle=True)
+    # 【変更: 新しいソースデータローダー】
+    combined_source_train_loader = DataLoader(combined_source_dataset, batch_size=batch_size, shuffle=True)
+    # source_train_loader = DataLoader(source_train_dataset, batch_size=batch_size, shuffle=True)
     target_train_loader = DataLoader(target_train_dataset, batch_size=batch_size, shuffle=True)
     target_test_loader = DataLoader(target_test_dataset, batch_size=batch_size, shuffle=False)
 
@@ -141,7 +168,8 @@ def create_dataloaders(source_train_path, target_train_path, target_test_path):
         'target_train_loc_counts': target_train_loc_counts # 追加: 各座標のデータ総数を格納
     }
 
-    return source_train_loader, target_train_loader, target_test_loader, data_scalers
+    # return source_train_loader, target_train_loader, target_test_loader, data_scalers
+    return combined_source_train_loader, target_train_loader, target_test_loader, data_scalers
 
 # --- 2. TransLocのネットワークアーキテクチャ定義 ---
 
@@ -997,8 +1025,10 @@ if __name__ == "__main__":
     # date = '20251030'
     train_date = '20251030'
     test_date = '20251030'
+    e1_date = '20251030'
     train_scene = 'non_obst'#'half_wall_A'#'Tripod_non_obst'
-    test_scene = 'half_wall_A'#'Tripod_aluminum_foil_whiteboard_A'#'wall_A'#'wall_A'#'non_obst'#'1_lounges_whiteboard_A'#'wall'
+    test_scene = 'wall_A'#'Tripod_aluminum_foil_whiteboard_A'#'wall_A'#'wall_A'#'non_obst'#'1_lounges_whiteboard_A'#'wall'
+    e1_scene = 'half_wall_A'
     # source_train_path = f'./data/uwb/processed_uwb_full_features_data_{train_scene}.csv'
     # target_train_path = f'./data/uwb/processed_uwb_full_features_data_{test_scene}_train_split.csv'
     # target_test_path = f'./data/uwb/processed_uwb_full_features_data_{test_scene}_test_split.csv'
@@ -1008,9 +1038,10 @@ if __name__ == "__main__":
     source_train_path = f'./data/uwb/{train_date}/processed_uwb_full_features_data_{train_scene}_train_split.csv'
     target_train_path = f'./data/uwb/{test_date}/processed_uwb_full_features_data_{test_scene}_train_split.csv'
     target_test_path = f'./data/uwb/{test_date}/processed_uwb_full_features_data_{test_scene}_test_split.csv'
+    e1_pseudo_path = f'./data/pseudo_data/pseudo_labeled_data_last_epoch_train_non_obst_20251030_test_half_wall_A_20251030_rsl.csv'
 
     source_train_loader, target_train_loader, target_test_loader, data_scalers = create_dataloaders(
-        source_train_path, target_train_path, target_test_path
+        source_train_path, target_train_path, target_test_path, e1_pseudo_path
     )
 
     # 入力/出力次元の取得
@@ -1088,7 +1119,7 @@ if __name__ == "__main__":
     avg_test_distance = total_test_distance / len(target_test_loader.dataset)
     # print(f"\nFinal Test Localization Error: {avg_test_distance:.4f} m ")
     print(f"\nFinal Test Localization Error: {avg_test_distance} m ")
-    with open(f"./output/localization_error_test_rsl.txt", "a", encoding="utf-8") as f:
+    with open(f"./output/localization_error_test_rsl_3env.txt", "a", encoding="utf-8") as f:
         # print(f"\ntrain_{train_scene}_test_{test_scene}\nFinal Test Localization Error: {avg_test_distance:.4f} m ", file=f)
         # print(f"\ntrain_{train_scene}_test_{test_scene}\nFinal Test Localization Error: {avg_test_distance} m ", file=f)
         print(f"\ntrain_{train_scene}_{train_date}_test_{test_scene}_{test_date}\nFinal Test Localization Error: {avg_test_distance} m ", file=f)
@@ -1167,7 +1198,7 @@ if __name__ == "__main__":
     plt.gca().set_aspect('equal', adjustable='box') # アスペクト比を等しくして、歪みをなくす
     plt.tight_layout()
     # plt.savefig(f'./output/final_localization_avg_plot_train_{train_scene}_test_{test_scene}.png')
-    plt.savefig(f'./output/final_localization_avg_plot_train_{train_scene}_{train_date}_test_{test_scene}_{test_date}_transloc_rsl.png')
+    plt.savefig(f'./output/final_localization_avg_plot_train_{train_scene}_{train_date}_test_{test_scene}_{test_date}_transloc_rsl_3env.png')
     plt.close()
     print(f"Final localization average plot generated: final_localization_avg_plot_train_{train_scene}_test_{test_scene}.png")
 
@@ -1189,7 +1220,7 @@ if __name__ == "__main__":
     plt.grid(True)
     plt.tight_layout()
     # plt.savefig(f'./output/transloc_training_losses_train_{train_scene}_test_{test_scene}.png')
-    plt.savefig(f'./output/transloc_training_losses_train_{train_scene}_{train_date}_test_{test_scene}_{test_date}_rsl.png')
+    plt.savefig(f'./output/transloc_training_losses_train_{train_scene}_{train_date}_test_{test_scene}_{test_date}_rsl_3env.png')
     plt.close()
 
     # Plotting Test Localization Error
@@ -1201,7 +1232,7 @@ if __name__ == "__main__":
     plt.grid(True)
     plt.tight_layout()
     # plt.savefig(f'./output/transloc_test_error_train_{train_scene}_test_{test_scene}.png')
-    plt.savefig(f'./output/transloc_test_error_train_{train_scene}_{train_date}_test_{test_scene}_{test_date}_rsl.png')
+    plt.savefig(f'./output/transloc_test_error_train_{train_scene}_{train_date}_test_{test_scene}_{test_date}_rsl_3env.png')
     plt.close()
 
     print("Plots generated: transloc_training_losses.png and transloc_test_error.png")
@@ -1216,13 +1247,13 @@ if __name__ == "__main__":
     plt.grid(True)
     plt.tight_layout()
     # plt.savefig(f'./output/transloc_pseudo_label_true_error_train{train_scene}test{test_scene}.png')
-    plt.savefig(f'./output/transloc_pseudo_label_true_error_train_{train_scene}_{train_date}_test_{test_scene}_{test_date}_rsl.png')
+    plt.savefig(f'./output/transloc_pseudo_label_true_error_train_{train_scene}_{train_date}_test_{test_scene}_{test_date}_rsl_3env.png')
     plt.close()
 
     # Writing pseudo-label metrics to text file:
     test_error_map = {test_err_epochs[i]: test_err_hist[i] for i in range(len(test_err_epochs))}
 
-    with open(f"./output/pseudo_label_metrics_rsl.txt", "a", encoding="utf-8") as f:
+    with open(f"./output/pseudo_label_metrics_rsl_3env.txt", "a", encoding="utf-8") as f:
         f.write(f"train{train_scene}, test{test_scene}\n")
         f.write(f"Epoch,Total Pseudo-Labels,Avg Pseudo-Label Consistency Error,Avg Pseudo-Label True Error,Test Localization Error (m)\n") # ヘッダー修正
         for i in range(len(epochs_range)):
@@ -1248,13 +1279,13 @@ if __name__ == "__main__":
     plt.grid(True)
     plt.tight_layout()
     # plt.savefig(f'./output/transloc_pseudo_label_counts_train{train_scene}test{test_scene}.png')
-    plt.savefig(f'./output/transloc_pseudo_label_counts_train{train_scene}_{train_date}_test{test_scene}_{test_date}_rsl.png')
+    plt.savefig(f'./output/transloc_pseudo_label_counts_train{train_scene}_{train_date}_test{test_scene}_{test_date}_rsl_3env.png')
     plt.close()
 
     print(f"Pseudo-label counts plot saved to /transloc_pseudo_label_counts_train{train_scene}test{test_scene}_rsl.png")
 
     # 擬似ラベルの位置情報をテキストファイルに保存 (追加)
-    pseudo_label_locations_filename = f"./output/pseudo_label_each_locations_rsl.txt"
+    pseudo_label_locations_filename = f"./output/pseudo_label_each_locations_rsl_3env.txt"
     with open(pseudo_label_locations_filename, "a", encoding="utf-8") as f:
         # f.write(f"=== train {train_scene}, test {test_scene}")
         f.write(f"=== train {train_scene} {train_date}, test {test_scene} {test_date}")
@@ -1269,7 +1300,7 @@ if __name__ == "__main__":
     print(f"Pseudo-label locations saved to {pseudo_label_locations_filename}")
 
     # 座標ごとの詳細な擬似ラベル統計をテキストファイルに保存 (追加)
-    detailed_stats_filename = f"./output/detailed_pseudo_label_stats_rsl.txt"
+    detailed_stats_filename = f"./output/detailed_pseudo_label_stats_rsl_3env.txt"
     with open(detailed_stats_filename, "a", encoding="utf-8") as f:
         # f.write(f"\n=== train {train_scene}, test {test_scene} ===\n")
         f.write(f"\n=== train {train_scene} {train_date}, test {test_scene} {test_date} ===\n")
@@ -1299,36 +1330,3 @@ if __name__ == "__main__":
     # 平均誤差（全点平均）
     mean_error = np.mean(errors)
     print(f"\nAverage localization error: {mean_error:.3f} m")
-
-    # --- 最後のEpochの擬似ラベル付きRSLデータをCSVで保存 (ここから追加) ---
-    print("\nSaving last epoch pseudo-labeled data to CSV...")
-    
-    rss_cols = data_scalers['rss_cols']
-    loc_cols = data_scalers['loc_cols']
-    loc_scaler = data_scalers['loc_scaler']
-    rss_scaler = data_scalers['rss_scaler']
-    
-    all_data = []
-
-    for rss_tensor, pseudo_loc_tensor in last_epoch_pseudo_data:
-        # 1. RSS特徴量を逆正規化
-        rss_unscaled = rss_scaler.inverse_transform(rss_tensor.numpy().reshape(1, -1)).flatten()
-        # 2. 擬似ラベル位置を逆正規化
-        pseudo_loc_unscaled = loc_scaler.inverse_transform(pseudo_loc_tensor.numpy().reshape(1, -1)).flatten()
-        
-        # 3. データを結合してリストに追加
-        row_data = np.concatenate([rss_unscaled, pseudo_loc_unscaled])
-        all_data.append(row_data)
-
-    if all_data:
-        # DataFrameを作成
-        df_cols = rss_cols + [f'pseudo_{c}' for c in loc_cols]
-        df_pseudo_labeled = pd.DataFrame(all_data, columns=df_cols)
-        
-        # CSVファイル名を定義
-        csv_filename = f'./data/pseudo_data/pseudo_labeled_data_last_epoch_train_{train_scene}_{train_date}_test_{test_scene}_{test_date}_rsl.csv'
-        df_pseudo_labeled.to_csv(csv_filename, index=False)
-        
-        print(f"Successfully saved {len(df_pseudo_labeled)} pseudo-labeled samples to {csv_filename}")
-    else:
-        print("No pseudo-labels were generated in the last epoch to save.")

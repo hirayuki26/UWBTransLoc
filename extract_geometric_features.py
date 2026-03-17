@@ -42,6 +42,84 @@ class WiFiDataset(Dataset):
             loc = self.target_transform(loc)
         
         return torch.tensor(rss, dtype=torch.float32), torch.tensor(loc, dtype=torch.float32)
+
+# --- 幾何学的特徴量計算用のヘルパー関数 ---
+def point_to_line_segment_distance(px, py, x1, y1, x2, y2):
+    """点P(px, py)と壁の線分AB((x1, y1), (x2, y2))の最短距離を計算"""
+    line_vec = np.array([x2 - x1, y2 - y1])
+    p_vec = np.array([px - x1, py - y1])
+    line_len_sq = np.dot(line_vec, line_vec)
+    
+    if line_len_sq == 0:
+        return np.linalg.norm(p_vec)
+        
+    # 線分上の最近傍点（投影点）を計算
+    t = max(0, min(1, np.dot(p_vec, line_vec) / line_len_sq))
+    proj_x = x1 + t * line_vec[0]
+    proj_y = y1 + t * line_vec[1]
+    
+    return np.sqrt((px - proj_x)**2 + (py - proj_y)**2)
+
+# --- 特徴量抽出とCSV保存を行う関数 ---
+def extract_and_save_features(model, dataloader, data_scalers, ap_coords, wall_lines, save_path):
+    """予測座標から距離と角度を計算し、元の特徴量と結合してCSVに保存する"""
+    model.eval()
+    all_rows = []
+    
+    rss_scaler = data_scalers['rss_scaler']
+    loc_scaler = data_scalers['loc_scaler']
+    rss_cols = data_scalers['rss_cols']
+    
+    print("\nExtracting geometric features and saving to CSV...")
+    
+    with torch.no_grad():
+        for rss, loc in dataloader:
+            rss = rss.to(device)
+            # モデルで位置を予測
+            pred_loc_avg, _, _, _ = model(rss)
+            
+            # 元のスケールに戻す（逆正規化）
+            rss_unscaled = rss_scaler.inverse_transform(rss.cpu().numpy())
+            pred_loc_unscaled = loc_scaler.inverse_transform(pred_loc_avg.cpu().numpy())
+            true_loc_unscaled = loc_scaler.inverse_transform(loc.numpy())
+            
+            for i in range(len(pred_loc_unscaled)):
+                px, py = pred_loc_unscaled[i]
+                row_dict = {}
+                
+                # 1. 元のRSS特徴量を追加
+                for j, col in enumerate(rss_cols):
+                    row_dict[col] = rss_unscaled[i, j]
+                    
+                # 2. 予測したX, Y座標を追加
+                # row_dict['pred_x'] = px
+                # row_dict['pred_y'] = py
+                
+                # 3. 基地局(AP)との距離と角度を計算
+                for ap_name, (apx, apy) in ap_coords.items():
+                    dist = np.sqrt((px - apx)**2 + (py - apy)**2)
+                    angle_rad = np.arctan2(py - apy, px - apx)
+                    angle_deg = np.degrees(angle_rad) # 度数法に変換
+                    
+                    row_dict[f'dist_to_{ap_name}'] = dist
+                    row_dict[f'angle_to_{ap_name}_deg'] = angle_deg
+                    
+                # 4. 壁(線分)との最短距離を計算
+                for wall_name, ((x1, y1), (x2, y2)) in wall_lines.items():
+                    dist_to_wall = point_to_line_segment_distance(px, py, x1, y1, x2, y2)
+                    row_dict[f'dist_to_{wall_name}'] = dist_to_wall
+                    
+                # 5. 正解ラベル(真のターゲット座標)を最後に追加
+                row_dict['x'] = true_loc_unscaled[i, 0]
+                row_dict['y'] = true_loc_unscaled[i, 1]
+                
+                all_rows.append(row_dict)
+                
+    # DataFrameに変換してCSV保存
+    df = pd.DataFrame(all_rows)
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    df.to_csv(save_path, index=False)
+    print(f"-> Successfully saved {len(df)} records with new features to: {save_path}")
     
 def align_dataframe_columns(df, target_cols, fill_value=NO_SIGNAL_VALUE):
     current_cols = set(df.columns)
@@ -53,8 +131,12 @@ def align_dataframe_columns(df, target_cols, fill_value=NO_SIGNAL_VALUE):
     return df[target_cols]
 
 # データローダーの作成関数を修正し、target_train_pathを不要にする
-def create_dataloaders_for_localization(source_train_path, test_path):
+def create_dataloaders_for_localization(source_train_path, test_path, ap_filter_list=None):
     loc_cols = QUANTITATIVE_COLUMNS
+
+    # ap_filter_list が None の場合は、デフォルトで空のリスト（全てのAPを使用）とする
+    if ap_filter_list is None:
+        ap_filter_list = []
 
     # 全てのデータファイルを読み込み、全てのAP列名を収集する
     source_train_raw = pd.read_csv(source_train_path)
@@ -67,12 +149,30 @@ def create_dataloaders_for_localization(source_train_path, test_path):
     
     all_rss_cols = sorted(list(all_ap_cols_set)) # APの列名をソートして固定順にする
 
+    rsl_only_cols = [col for col in all_rss_cols if col.endswith('_rng_rng')]
+    # rsl_only_cols = [col for col in all_rss_cols if col.endswith('_rsl')]
+    # rsl_only_cols = all_rss_cols
+
+    # APフィルタリング
+    if ap_filter_list:
+        # ap_filter_list に要素がある場合（特定のAPを指定した場合）
+        final_rss_cols = []
+        for col in rsl_only_cols:
+            # col が ap_filter_list のいずれかの要素で始まるかチェックする
+            if any(col.startswith(ap) for ap in ap_filter_list):
+                final_rss_cols.append(col)
+    else:
+        # ap_filter_list が空のリストの場合（全てのAPを指定したい場合）
+        # rsl_only_cols の内容をそのまま使用する
+        final_rss_cols = rsl_only_cols
+
     # 各データセットを整形する (AP列の統一と欠損値の埋め合わせ)
     source_train_aligned = align_dataframe_columns(source_train_raw.copy(), all_rss_cols + loc_cols)
     test_aligned = align_dataframe_columns(test_raw.copy(), all_rss_cols + loc_cols)
 
     # スケーリングのためのデータ結合 (Source Train と Test のみ)
-    all_rss_data = pd.concat([source_train_aligned[all_rss_cols], test_aligned[all_rss_cols]])
+    # all_rss_data = pd.concat([source_train_aligned[rsl_only_cols], test_aligned[rsl_only_cols]])
+    all_rss_data = pd.concat([source_train_aligned[final_rss_cols], test_aligned[final_rss_cols]])
     all_loc_data = pd.concat([source_train_aligned[loc_cols], test_aligned[loc_cols]])
 
     # スケーラー初期化
@@ -88,8 +188,10 @@ def create_dataloaders_for_localization(source_train_path, test_path):
     loc_transform = lambda y: loc_scaler.transform(y.reshape(1, -1)).flatten()
 
     # データセット作成
-    source_train_dataset = WiFiDataset(source_train_aligned, all_rss_cols, loc_cols, transform=rss_transform, target_transform=loc_transform)
-    test_dataset = WiFiDataset(test_aligned, all_rss_cols, loc_cols, transform=rss_transform, target_transform=loc_transform)
+    # source_train_dataset = WiFiDataset(source_train_aligned, rsl_only_cols, loc_cols, transform=rss_transform, target_transform=loc_transform)
+    # test_dataset = WiFiDataset(test_aligned, rsl_only_cols, loc_cols, transform=rss_transform, target_transform=loc_transform)
+    source_train_dataset = WiFiDataset(source_train_aligned, final_rss_cols, loc_cols, transform=rss_transform, target_transform=loc_transform)
+    test_dataset = WiFiDataset(test_aligned, final_rss_cols, loc_cols, transform=rss_transform, target_transform=loc_transform)
 
     # データローダー作成
     batch_size = 64
@@ -99,7 +201,8 @@ def create_dataloaders_for_localization(source_train_path, test_path):
     data_scalers = {
         'rss_scaler': rss_scaler,
         'loc_scaler': loc_scaler,
-        'rss_cols': all_rss_cols,
+        # 'rss_cols': rsl_only_cols,
+        'rss_cols': final_rss_cols,
         'loc_cols': loc_cols
     }
 
@@ -277,10 +380,11 @@ if __name__ == "__main__":
     # テストには、ラベルのないターゲットドメインのRSSデータ（ただし、評価のために真のラベルは必要）
     # 元のファイルパスを使用する代わりに、train_sceneとtest_sceneを使用
     # date = '20251030'
-    train_date = '20251022'
-    test_date = '20251022'
-    train_scene = 'non_obst'#'half_wall_A' # Source Domain (ラベルありデータ)
-    test_scene = 'non_obst'#'half_wall_A'#'non_obst'#'1_lounges_whiteboard_A'#'wall'      # Test Data (ラベルあり、評価用)
+    train_date = '20251228'#'20251030'
+    test_date = '20251228'
+    train_scene = '12Anchors_1Tag_non_obst'
+    # train_scene = '12Anchors_1Tag_wallA_15'#'1805NLOS_Aluminu_foilW'#'non_obst'#'Tripod_aluminum_foil_whiteboard_A'#'non_obst'#'wall_A' # Source Domain (ラベルありデータ)
+    test_scene = '12Anchors_1Tag_wallA_15'#'1805NLOS_Aluminu_foilW'#'Aluminum_foilW_A_35'#'Tripod_aluminum_foil_whiteboard_A'#'half_wall_A'#'non_obst'#'1_lounges_whiteboard_A'#'wall'      # Test Data (ラベルあり、評価用)
 
     # source_train_path = f'./data/uwb/processed_uwb_full_features_data_{train_scene}_train_split.csv'
     # source_train_path = f'./data/uwb/{date}/processed_uwb_full_features_data_{train_scene}_train_split.csv'
@@ -289,11 +393,60 @@ if __name__ == "__main__":
     # target_train_pathはここでは使用しない（ドメイン適応を行わないため）
     # test_path = f'./data/uwb/processed_uwb_full_features_data_{test_scene}_test_split.csv'
     # test_path = f'./data/uwb/{date}/processed_uwb_full_features_data_{test_scene}_test_split.csv'
-    test_path = f'./data/uwb/{test_date}/processed_uwb_full_features_data_{test_scene}_test_split.csv'
+    # test_path = f'./data/uwb/{test_date}/processed_uwb_full_features_data_{test_scene}_test_split.csv'
+    test_data_path = f'processed_uwb_full_features_data_{test_scene}_test_split' #f'processed_uwb_full_features_data_{train_scene}_train_split' #f'processed_uwb_full_features_data_{train_scene}_train_split' #f'processed_uwb_full_features_data_{train_scene}_test_split' #f'processed_uwb_full_features_data_{test_scene}_train_split'
+    test_path = f'./data/uwb/{test_date}/' + test_data_path + '.csv'
+
+    # ap_filter_list = [
+    #     # 'AP910',
+    #     'AP4250',
+    #     'AP4245',
+    #     'AP17057',
+    #     # 'AP23196'
+    # ]
+
+    ap_filter_list = { # 12Anchors
+        'AP4524': 4524, # (0, -1.5)
+        'AP5307': 5307, # (0, 3)
+        # 'AP36794': 36794, # (-1.5, 0)
+        # 'AP37248': 37248, # (-1.5, 1.5)
+        # 'AP37051': 37051, # (3, 1.5)
+        # 'AP7091': 7091, # (3, 0)
+        'AP910': 910, # (1.5, 3)
+        # 'AP1805': 1805, # (1.5, -1.5)
+        # 'AP4250': 4250, # (0.75, 3)
+        # 'AP17057': 17057, # (0.75, -1.5)
+        # 'AP37045': 37045, # (-1.5, 0.75)
+        # 'AP23196': 23196 # (3, 0.75)
+    }
+
+    # 【追加】基地局の座標辞書
+    ap_coords = {
+        'AP4524': (0.0, -1.5),
+        'AP5307': (0.0, 3.0),
+        # 'AP36794': (-1.5, 0.0),
+        # 'AP37248': (-1.5, 1.5),
+        # 'AP37051': (3.0, 1.5),
+        # 'AP7091': (3.0, 0.0),
+        'AP910': (1.5, 3.0),
+        # 'AP1805': (1.5, -1.5),
+        # 'AP4250': (0.75, 3.0),
+        # 'AP17057': (0.75, -1.5),
+        # 'AP37045': (-1.5, 0.75),
+        # 'AP23196': (3.0, 0.75)
+    }
+
+    # 【追加】壁の座標（始点と終点）
+    wall_lines = {
+        'Wall_North': ((-4.0, 5.6), (8.5, 5.6)),
+        'Wall_South': ((-4.0, -4.1), (8.5, -4.1)),
+        'Wall_East': ((8.5, -4.1), (8.5, 5.6)),
+        'Wall_West': ((-4.0, -4.1), (-4.0, 5.6))
+    }
 
     # create_dataloaders関数をcreate_dataloaders_for_localizationに置き換え
     source_train_loader, test_loader, data_scalers = create_dataloaders_for_localization(
-        source_train_path, test_path
+        source_train_path, test_path, ap_filter_list
     )
 
     # 入力/出力次元の取得
@@ -321,19 +474,32 @@ if __name__ == "__main__":
     output_dir = "./output"
     os.makedirs(output_dir, exist_ok=True)
     model_save_path = os.path.join(output_dir, f"localization_model_train_{train_scene}_test_{test_scene}_localize.pth")
-    torch.save(model.state_dict(), model_save_path)
+    # torch.save(model.state_dict(), model_save_path)
     print(f"Model saved to {model_save_path}")
 
     # 最終評価結果の保存
-    final_error_file_path = os.path.join(output_dir, f"localization_error_result_localize.txt")
+    final_error_file_path = os.path.join(output_dir, f"localization_error_result_localize_rsl.txt")
     with open(final_error_file_path, "a", encoding="utf-8") as f:
         final_error = test_err_hist[-1] if test_err_hist else float('nan')
-        f.write(f"train_{train_scene}_test_{test_scene}\nFinal Test Localization Error: {final_error:.4f} m\n")
+        # f.write(f"train_{train_scene}_test_{test_scene}\nFinal Test Localization Error: {final_error:.4f} m\n")
     print(f"Final localization error saved to {final_error_file_path}")
     print("Final Test Localization Error: {final_error:.4f} m\n")
 
     # --- 測位結果のプロット (平均プロット点ごとに表示) ---
     print("\nPlotting final localization results with average predicted points...")
+
+    new_data_dir = f"./data/wall_ap_features/"
+
+    extracted_features_csv_path = os.path.join(new_data_dir, f"extracted_{test_data_path}_{test_date}.csv")
+    extract_and_save_features(
+        model=model, 
+        dataloader=test_loader, 
+        data_scalers=data_scalers, 
+        ap_coords=ap_coords, 
+        wall_lines=wall_lines, 
+        save_path=extracted_features_csv_path
+    )
+
     
     # 最終評価時の全予測位置と真の位置を再取得（または前のループで保存したものを利用）
     # この例では、最終評価部分でall_true_locsとall_predicted_locsが既に収集されていると仮定
@@ -393,35 +559,37 @@ if __name__ == "__main__":
     plt.gca().set_aspect('equal', adjustable='box')
     plt.tight_layout()
     # plot_save_path_avg = os.path.join(output_dir, f'final_localization_avg_plot_train_{train_scene}_test_{test_scene}_localize.png')
-    plot_save_path_avg = os.path.join(output_dir, f'final_localization_avg_plot_train_{train_scene}_{train_date}_test_{test_scene}_{test_date}_localize.png')
+    plot_save_path_avg = os.path.join(new_data_dir, f'final_localization_avg_plot_train_{train_scene}_{train_date}_test_{test_scene}_{test_date}_localize_rsl.png')
     plt.savefig(plot_save_path_avg)
+    # plt.show()
     plt.close()
     print(f"Final localization average plot generated: {plot_save_path_avg}")
 
-    # Plotting Test Localization Error over epochs
-    plt.figure(figsize=(10, 6))
-    plt.plot(test_err_epochs, test_err_hist, marker='o', linestyle='-', color='blue')
-    plt.xlabel('Epoch')
-    plt.ylabel('Localization Error (m)')
-    plt.title(f'Localization Error Over Epochs (Train:{train_scene}, Test:{test_scene})')
-    plt.grid(True)
-    plt.tight_layout()
-    plot_save_path_err = os.path.join(output_dir, f'localization_error_plot_train_{train_scene}_test_{test_scene}_localize.png')
-    plt.savefig(plot_save_path_err)
-    plt.close()
-    print(f"Error plot generated: {plot_save_path_err}")
+    # # Plotting Test Localization Error over epochs
+    # plt.figure(figsize=(10, 6))
+    # plt.plot(test_err_epochs, test_err_hist, marker='o', linestyle='-', color='blue')
+    # plt.xlabel('Epoch')
+    # plt.ylabel('Localization Error (m)')
+    # plt.title(f'Localization Error Over Epochs (Train:{train_scene}, Test:{test_scene})')
+    # plt.grid(True)
+    # plt.tight_layout()
+    # plot_save_path_err = os.path.join(new_data_dir, f'localization_error_plot_train_{train_scene}_test_{test_scene}_localize_rsl.png')
+    # plt.savefig(plot_save_path_err)
+    # # plt.show()
+    # plt.close()
+    # print(f"Error plot generated: {plot_save_path_err}")
 
-    print(f"Final Test Localization Error: {final_error} m\n")
+    # print(f"Final Test Localization Error: {final_error} m\n")
 
-    # 各点ごとの誤差（ユークリッド距離）を計算
-    errors = np.linalg.norm(unique_true_locs_avg - avg_predicted_locs, axis=1)
+    # # 各点ごとの誤差（ユークリッド距離）を計算
+    # errors = np.linalg.norm(unique_true_locs_avg - avg_predicted_locs, axis=1)
 
-    # 各真の位置と誤差を対応づけて出力
-    for i, err in enumerate(errors):
-        print(f"Point {i}: True=({unique_true_locs_avg[i,0]:.2f}, {unique_true_locs_avg[i,1]:.2f}), "
-            f"Pred=({avg_predicted_locs[i,0]:.2f}, {avg_predicted_locs[i,1]:.2f}), "
-            f"Error={err:.3f} m")
+    # # 各真の位置と誤差を対応づけて出力
+    # for i, err in enumerate(errors):
+    #     print(f"Point {i}: True=({unique_true_locs_avg[i,0]:.2f}, {unique_true_locs_avg[i,1]:.2f}), "
+    #         f"Pred=({avg_predicted_locs[i,0]:.2f}, {avg_predicted_locs[i,1]:.2f}), "
+    #         f"Error={err:.3f} m")
 
-    # 平均誤差（全点平均）
-    mean_error = np.mean(errors)
-    print(f"\nAverage localization error: {mean_error:.3f} m")
+    # # 平均誤差（全点平均）
+    # mean_error = np.mean(errors)
+    # print(f"\nAverage localization error: {mean_error:.3f} m")

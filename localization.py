@@ -1,5 +1,3 @@
-# filename: localization_program_simplified.py
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -8,11 +6,7 @@ import pandas as pd
 import numpy as np
 import os
 from sklearn.preprocessing import MinMaxScaler
-import math # mathモジュールはLocationPredictorのforwardで間接的に使用されるため保持
 import matplotlib.pyplot as plt
-
-import warnings
-warnings.filterwarnings('ignore')
 
 # デバイス設定
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -52,7 +46,6 @@ def align_dataframe_columns(df, target_cols, fill_value=NO_SIGNAL_VALUE):
     
     return df[target_cols]
 
-# データローダーの作成関数を修正し、target_train_pathを不要にする
 def create_dataloaders_for_localization(source_train_path, test_path):
     loc_cols = QUANTITATIVE_COLUMNS
 
@@ -71,7 +64,7 @@ def create_dataloaders_for_localization(source_train_path, test_path):
     source_train_aligned = align_dataframe_columns(source_train_raw.copy(), all_rss_cols + loc_cols)
     test_aligned = align_dataframe_columns(test_raw.copy(), all_rss_cols + loc_cols)
 
-    # スケーリングのためのデータ結合 (Source Train と Test のみ)
+    # スケーリングのためのデータ結合
     all_rss_data = pd.concat([source_train_aligned[all_rss_cols], test_aligned[all_rss_cols]])
     all_loc_data = pd.concat([source_train_aligned[loc_cols], test_aligned[loc_cols]])
 
@@ -87,7 +80,7 @@ def create_dataloaders_for_localization(source_train_path, test_path):
     rss_transform = lambda x: rss_scaler.transform(x.reshape(1, -1)).flatten()
     loc_transform = lambda y: loc_scaler.transform(y.reshape(1, -1)).flatten()
 
-    # データセット作成
+    # データセット作成 (テストデータもWiFiDatasetでラップ)
     source_train_dataset = WiFiDataset(source_train_aligned, all_rss_cols, loc_cols, transform=rss_transform, target_transform=loc_transform)
     test_dataset = WiFiDataset(test_aligned, all_rss_cols, loc_cols, transform=rss_transform, target_transform=loc_transform)
 
@@ -107,7 +100,7 @@ def create_dataloaders_for_localization(source_train_path, test_path):
 
 # --- 2. 測位用ネットワークアーキテクチャ定義 ---
 
-# ConvBlk (CNN Block) - 元のTransLocから変更なし
+# ConvBlk (CNN Block) - TransLocと同様
 class ConvBlk(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, stride, padding):
         super(ConvBlk, self).__init__()
@@ -123,7 +116,7 @@ class ConvBlk(nn.Module):
         x = self.pool(x)
         return x
 
-# Feature Extractor - 元のTransLocから変更なし
+# Feature Extractor - TransLocと同様だが、単体で学習
 class FeatureExtractor(nn.Module):
     def __init__(self, input_dim, z_dim=16):
         super(FeatureExtractor, self).__init__()
@@ -141,7 +134,7 @@ class FeatureExtractor(nn.Module):
         z = self.fc_final(x)
         return z
 
-# Location Predictor - 元のTransLocから変更なし (Tri-net構造を維持)
+# Location Predictor - TransLocと同様のTri-net構造
 class LocationPredictor(nn.Module):
     def __init__(self, z_dim=16, output_loc_dim=2):
         super(LocationPredictor, self).__init__()
@@ -164,6 +157,7 @@ class LocationPredictor(nn.Module):
         self.r3_fc2 = nn.Linear(2048, output_loc_dim)
 
     def forward(self, z):
+        # R_c (shared module)
         rc_features = self.rc_fc1(z)
         rc_features = rc_features.view(-1, 1, 32, 32)
         rc_features = self.rc_conv_blk(rc_features)
@@ -172,26 +166,30 @@ class LocationPredictor(nn.Module):
         
         rc_features_reshaped = rc_features.view(rc_features.size(0), 32, 8, 8)
 
+        # R_1 branch
         r1_out = self.r1_conv_blk(rc_features_reshaped)
         r1_out = r1_out.view(r1_out.size(0), -1)
         r1_out = self.r1_fc1(r1_out)
         r1_pred = self.r1_fc2(r1_out)
 
+        # R_2 branch
         r2_out = self.r2_conv_blk(rc_features_reshaped)
         r2_out = r2_out.view(r2_out.size(0), -1)
         r2_out = self.r2_fc1(r2_out)
         r2_pred = self.r2_fc2(r2_out)
 
+        # R_3 branch
         r3_out = self.r3_conv_blk(rc_features_reshaped)
         r3_out = r3_out.view(r3_out.size(0), -1)
         r3_out = self.r3_fc1(r3_out)
         r3_pred = self.r3_fc2(r3_out)
         
+        # Average of predictions for final output (Eq 9 in TransLoc paper)
         avg_pred = (r1_pred + r2_pred + r3_pred) / 3
+
         return avg_pred, r1_pred, r2_pred, r3_pred
 
 # 測位モデル (FeatureExtractorとLocationPredictorの組み合わせ)
-# 元のTransLocクラスから、GeneratorとDiscriminator、およびそれらに関連するロジックを削除
 class LocalizationModel(nn.Module):
     def __init__(self, input_dim, z_dim, output_loc_dim):
         super(LocalizationModel, self).__init__()
@@ -203,13 +201,12 @@ class LocalizationModel(nn.Module):
         avg_pred, r1_pred, r2_pred, r3_pred = self.location_predictor(z)
         return avg_pred, r1_pred, r2_pred, r3_pred
 
+
 # --- 3. 損失関数定義 ---
 location_criterion = nn.MSELoss() # 回帰タスクのためMSEを使用
 
 # --- 4. 学習ループ ---
-# train_transloc関数をtrain_localization_modelに修正
 def train_localization_model(model, source_train_loader, test_loader, data_scalers, num_epochs=100, lr=0.001):
-    # オプティマイザの定義 (FeatureExtractorとLocationPredictorのパラメータのみ)
     optimizer = optim.Adam(model.parameters(), lr=lr)
 
     test_error_history = []
@@ -225,11 +222,10 @@ def train_localization_model(model, source_train_loader, test_loader, data_scale
 
             optimizer.zero_grad()
             
-            # 測位部分の順伝播
+            # 測位部分
             predicted_loc_avg, predicted_loc_r1, predicted_loc_r2, predicted_loc_r3 = model(source_rss)
             
-            # 損失計算 (L_R^s のみを使用)
-            # Tri-netのDiversity Augmentationをそのまま利用するため、各サブモジュールの予測と平均予測の両方を考慮
+            # 損失計算 (L_R^s)
             loss = location_criterion(predicted_loc_avg, source_loc) + \
                    (location_criterion(predicted_loc_r1, source_loc) + \
                     location_criterion(predicted_loc_r2, source_loc) + \
@@ -242,14 +238,14 @@ def train_localization_model(model, source_train_loader, test_loader, data_scale
         print(f"Epoch {epoch+1}/{num_epochs}, Train Loss: {total_train_loss / len(source_train_loader):.4f}")
 
         # テストセットでの評価 (測位精度)
-        if (epoch + 1) % 10 == 0 or epoch == num_epochs - 1:
+        if (epoch + 1) % 10 == 0 or epoch == num_epochs - 1: # 10エポックごと、または最終エポックで評価
             model.eval()
             total_test_distance = 0
             with torch.no_grad():
                 for test_rss, test_loc in test_loader:
                     test_rss, test_loc = test_rss.to(device), test_loc.to(device)
                     
-                    # 測位部分の順伝播
+                    # 測位部分
                     predicted_loc_avg, _, _, _ = model(test_rss)
                     
                     # 予測位置を元のスケールに戻す
@@ -264,7 +260,7 @@ def train_localization_model(model, source_train_loader, test_loader, data_scale
             test_error_history.append(avg_test_distance)
             test_error_epochs_recorded.append(epoch + 1)
             print(f"--- Epoch {epoch+1} Test Localization Error: {avg_test_distance:.4f} m --- ")
-            model.train() # 訓練モードに戻す
+            model.train() # Set back to train mode
 
     print("Training finished.")
     return test_error_history, test_error_epochs_recorded
@@ -275,23 +271,13 @@ if __name__ == "__main__":
     # データローダーの作成
     # 学習にはSource Domainのデータのみを使用
     # テストには、ラベルのないターゲットドメインのRSSデータ（ただし、評価のために真のラベルは必要）
-    # 元のファイルパスを使用する代わりに、train_sceneとtest_sceneを使用
-    # date = '20251030'
-    train_date = '20251022'
-    test_date = '20251022'
-    train_scene = 'non_obst'#'half_wall_A' # Source Domain (ラベルありデータ)
-    test_scene = 'non_obst'#'half_wall_A'#'non_obst'#'1_lounges_whiteboard_A'#'wall'      # Test Data (ラベルあり、評価用)
+    # place_name = 'OfficeP2'
 
-    # source_train_path = f'./data/uwb/processed_uwb_full_features_data_{train_scene}_train_split.csv'
-    # source_train_path = f'./data/uwb/{date}/processed_uwb_full_features_data_{train_scene}_train_split.csv'
-    source_train_path = f'./data/uwb/{train_date}/processed_uwb_full_features_data_{train_scene}_train_split.csv'
+    train_scene = 'wall'
+    test_scene = 'wall'
+    source_train_path = f'./data/uwb/processed_uwb_full_features_data_{train_scene}_train_split.csv'
+    test_path = f'./data/uwb/processed_uwb_full_features_data_{test_scene}_test_split.csv'
 
-    # target_train_pathはここでは使用しない（ドメイン適応を行わないため）
-    # test_path = f'./data/uwb/processed_uwb_full_features_data_{test_scene}_test_split.csv'
-    # test_path = f'./data/uwb/{date}/processed_uwb_full_features_data_{test_scene}_test_split.csv'
-    test_path = f'./data/uwb/{test_date}/processed_uwb_full_features_data_{test_scene}_test_split.csv'
-
-    # create_dataloaders関数をcreate_dataloaders_for_localizationに置き換え
     source_train_loader, test_loader, data_scalers = create_dataloaders_for_localization(
         source_train_path, test_path
     )
@@ -299,75 +285,83 @@ if __name__ == "__main__":
     # 入力/出力次元の取得
     sample_rss, _ = next(iter(source_train_loader))
     input_dim = sample_rss.shape[1]
-    output_loc_dim = 2 # X, Y座標 
+    output_loc_dim = 2 # X, Y座標
 
     print(f"Input Dimension (RSS features): {input_dim}")
     print(f"Output Dimension (Location features): {output_loc_dim}")
     print(f"Number of samples in source_train: {len(source_train_loader.dataset)}")
     print(f"Number of samples in test: {len(test_loader.dataset)}")
 
-    # 測位モデルの初期化 (TransLocではなくLocalizationModelを使用)
+    # 測位モデルの初期化 (Generator, Discriminatorなし)
     z_dim = 16
     model = LocalizationModel(input_dim, z_dim, output_loc_dim).to(device)
     print("Localization Model initialized (without Domain Adaptation components).")
     print(model)
 
-    # 学習の実行
-    test_err_hist, test_err_epochs = train_localization_model(
-        model, source_train_loader, test_loader, data_scalers, num_epochs=50, lr=0.0001
-    )
+    # # モデルの保存 (オプション)
+    torch.save(model.state_dict(), f"./output/transloc_model_train_{train_scene}test_{test_scene}_localize.pth")
+    print("Model saved to transloc_model.pth")
 
-    # モデルの保存
-    output_dir = "./output"
-    os.makedirs(output_dir, exist_ok=True)
-    model_save_path = os.path.join(output_dir, f"localization_model_train_{train_scene}_test_{test_scene}_localize.pth")
-    torch.save(model.state_dict(), model_save_path)
-    print(f"Model saved to {model_save_path}")
-
-    # 最終評価結果の保存
-    final_error_file_path = os.path.join(output_dir, f"localization_error_result_localize.txt")
-    with open(final_error_file_path, "a", encoding="utf-8") as f:
-        final_error = test_err_hist[-1] if test_err_hist else float('nan')
-        f.write(f"train_{train_scene}_test_{test_scene}\nFinal Test Localization Error: {final_error:.4f} m\n")
-    print(f"Final localization error saved to {final_error_file_path}")
-    print("Final Test Localization Error: {final_error:.4f} m\n")
-
-    # --- 測位結果のプロット (平均プロット点ごとに表示) ---
-    print("\nPlotting final localization results with average predicted points...")
-    
-    # 最終評価時の全予測位置と真の位置を再取得（または前のループで保存したものを利用）
-    # この例では、最終評価部分でall_true_locsとall_predicted_locsが既に収集されていると仮定
-    # 実際には、train_localization_model関数からこれらを返すか、別途評価関数を定義して取得するのがよりクリーン
-    # ここでは、簡略化のため、再評価を行います（計算コストは増えるが、ロジックは明確）
+    # # テストデータで最終評価
     model.eval()
-    all_true_locs_for_plot = []
-    all_predicted_locs_for_plot = []
+    total_test_distance = 0
+    all_true_locs = []
+    all_predicted_locs = []
     with torch.no_grad():
         for test_rss, test_loc in test_loader:
             test_rss, test_loc = test_rss.to(device), test_loc.to(device)
-            predicted_loc_avg, _, _, _ = model(test_rss)
+            z_test = model.feature_extractor(test_rss)
+            predicted_loc_avg, _, _, _ = model.location_predictor(z_test)
             
             predicted_loc_unscaled = data_scalers['loc_scaler'].inverse_transform(predicted_loc_avg.cpu().numpy())
             true_loc_unscaled = data_scalers['loc_scaler'].inverse_transform(test_loc.cpu().numpy())
 
-            all_true_locs_for_plot.extend(true_loc_unscaled)
-            all_predicted_locs_for_plot.extend(predicted_loc_unscaled)
+            distances = np.sqrt(np.sum((predicted_loc_unscaled - true_loc_unscaled)**2, axis=1))
+            total_test_distance += np.sum(distances)
 
-    all_true_locs_for_plot = np.array(all_true_locs_for_plot)
-    all_predicted_locs_for_plot = np.array(all_predicted_locs_for_plot)
+            all_true_locs.extend(true_loc_unscaled)
+            all_predicted_locs.extend(predicted_loc_unscaled)
+    
+    avg_test_distance = total_test_distance / len(test_loader.dataset)
+    # print(f"\nFinal Test Localization Error: {avg_test_distance:.4f} m ")
+    print(f"\nFinal Test Localization Error: {avg_test_distance} m ")
+    with open(f"./output/localization_error_test_localize.txt", "a", encoding="utf-8") as f:
+        # print(f"\ntrain_{train_scene}_test_{test_scene}\nFinal Test Localization Error: {avg_test_distance:.4f} m ", file=f)
+        print(f"\ntrain_{train_scene}_test_{test_scene}\nFinal Test Localization Error: {avg_test_distance} m ", file=f)
 
-    # ユニークな真の位置とその予測位置をグループ化し、平均を計算
+    # Plotting Test Localization Error
+    # plt.figure(figsize=(10, 6))
+    # plt.plot(test_err_epochs, test_err_hist, marker='o', linestyle='-', color='blue')
+    # plt.xlabel('Epoch')
+    # plt.ylabel('Localization Error (m)')
+    # plt.title(f'Localization Error Over Epochs ( Train:{train_scene}, Test:{test_scene})')
+    # plt.grid(True)
+    # plt.tight_layout()
+    # plt.savefig(os.path.join(output_dir, f'localization_error_plot_train{train_scene}_test{test_scene}_localize.png'))
+    # plt.close()
+    # print(f"Plot generated: {os.path.join(output_dir, f'localization_error_plot_train{train_scene}_test{test_scene}.png')}")
+
+    # --- 測位結果のプロット (平均プロット点ごとに表示) ---
+    print("\nPlotting final localization results with average predicted points...")
+    
+    all_true_locs = np.array(all_true_locs)
+    all_predicted_locs = np.array(all_predicted_locs)
+
+    # ユニークな真の位置とその予測位置をグループ化
+    # Key: tuple(true_x, true_y), Value: list of [pred_x, pred_y]
     grouped_predictions = {}
-    for i in range(len(all_true_locs_for_plot)):
-        true_loc_tuple = tuple(all_true_locs_for_plot[i]) 
+    for i in range(len(all_true_locs)):
+        # NumPy配列を辞書のキーとして使うためにタプルに変換
+        true_loc_tuple = tuple(all_true_locs[i]) 
         if true_loc_tuple not in grouped_predictions:
             grouped_predictions[true_loc_tuple] = []
-        grouped_predictions[true_loc_tuple].append(all_predicted_locs_for_plot[i])
+        grouped_predictions[true_loc_tuple].append(all_predicted_locs[i])
 
+    # 各ユニークな真の位置に対応する平均予測位置を計算
     unique_true_locs_avg = []
     avg_predicted_locs = []
     for true_loc_tuple, pred_locs_list in grouped_predictions.items():
-        unique_true_locs_avg.append(list(true_loc_tuple))
+        unique_true_locs_avg.append(list(true_loc_tuple)) # リストに戻す
         avg_pred_for_this_true_loc = np.mean(pred_locs_list, axis=0)
         avg_predicted_locs.append(avg_pred_for_this_true_loc)
 
@@ -375,53 +369,26 @@ if __name__ == "__main__":
     avg_predicted_locs = np.array(avg_predicted_locs)
 
     plt.figure(figsize=(10, 8))
+    # ユニークな真の位置をプロット (大きめのマーカー)
     plt.scatter(unique_true_locs_avg[:, 0], unique_true_locs_avg[:, 1], 
                 c='blue', marker='o', s=100, label='True Locations (Unique Points)', alpha=0.9)
+    # 平均予測位置をプロット (大きめのマーカー)
     plt.scatter(avg_predicted_locs[:, 0], avg_predicted_locs[:, 1], 
                 c='red', marker='x', s=100, label='Average Predicted Locations', alpha=0.9)
 
+    # 各真の位置と平均予測位置を結ぶ線を描画 (誤差ベクトル)
     for i in range(len(unique_true_locs_avg)):
         plt.plot([unique_true_locs_avg[i, 0], avg_predicted_locs[i, 0]],
                  [unique_true_locs_avg[i, 1], avg_predicted_locs[i, 1]],
-                 'k-', linewidth=1.0, alpha=0.6)
+                 'k-', linewidth=1.0, alpha=0.6) # 黒線、太め、半透明
 
     plt.xlabel('X Coordinate (m)')
     plt.ylabel('Y Coordinate (m)')
     plt.title(f'Final Localization Results: True vs. Average Predicted (Test Scene: {test_scene})')
     plt.legend()
     plt.grid(True)
-    plt.gca().set_aspect('equal', adjustable='box')
+    plt.gca().set_aspect('equal', adjustable='box') # アスペクト比を等しくして、歪みをなくす
     plt.tight_layout()
-    # plot_save_path_avg = os.path.join(output_dir, f'final_localization_avg_plot_train_{train_scene}_test_{test_scene}_localize.png')
-    plot_save_path_avg = os.path.join(output_dir, f'final_localization_avg_plot_train_{train_scene}_{train_date}_test_{test_scene}_{test_date}_localize.png')
-    plt.savefig(plot_save_path_avg)
+    plt.savefig(f'./output/final_localization_avg_plot_train_{train_scene}_test_{test_scene}_localize.png')
     plt.close()
-    print(f"Final localization average plot generated: {plot_save_path_avg}")
-
-    # Plotting Test Localization Error over epochs
-    plt.figure(figsize=(10, 6))
-    plt.plot(test_err_epochs, test_err_hist, marker='o', linestyle='-', color='blue')
-    plt.xlabel('Epoch')
-    plt.ylabel('Localization Error (m)')
-    plt.title(f'Localization Error Over Epochs (Train:{train_scene}, Test:{test_scene})')
-    plt.grid(True)
-    plt.tight_layout()
-    plot_save_path_err = os.path.join(output_dir, f'localization_error_plot_train_{train_scene}_test_{test_scene}_localize.png')
-    plt.savefig(plot_save_path_err)
-    plt.close()
-    print(f"Error plot generated: {plot_save_path_err}")
-
-    print(f"Final Test Localization Error: {final_error} m\n")
-
-    # 各点ごとの誤差（ユークリッド距離）を計算
-    errors = np.linalg.norm(unique_true_locs_avg - avg_predicted_locs, axis=1)
-
-    # 各真の位置と誤差を対応づけて出力
-    for i, err in enumerate(errors):
-        print(f"Point {i}: True=({unique_true_locs_avg[i,0]:.2f}, {unique_true_locs_avg[i,1]:.2f}), "
-            f"Pred=({avg_predicted_locs[i,0]:.2f}, {avg_predicted_locs[i,1]:.2f}), "
-            f"Error={err:.3f} m")
-
-    # 平均誤差（全点平均）
-    mean_error = np.mean(errors)
-    print(f"\nAverage localization error: {mean_error:.3f} m")
+    print(f"Final localization average plot generated: final_localization_avg_plot_train_{train_scene}_test_{test_scene}_localize.png")

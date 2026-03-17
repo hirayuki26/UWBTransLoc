@@ -59,8 +59,12 @@ def align_dataframe_columns(df, target_cols, fill_value=NO_SIGNAL_VALUE):
     # target_colsの順序に並べ替える (重要)
     return df[target_cols]
 
-def create_dataloaders(source_train_path, target_train_path, target_test_path):
+def create_dataloaders(source_train_path, target_train_path, target_test_path, ap_filter_list=None):
     loc_cols = QUANTITATIVE_COLUMNS
+
+    # ap_filter_list が None の場合は、デフォルトで空のリスト（全てのAPを使用）とする
+    if ap_filter_list is None:
+        ap_filter_list = []
 
     # 1. 全てのデータファイルを読み込み、全てのAP列名を収集する
     source_train_raw = pd.read_csv(source_train_path)
@@ -75,7 +79,22 @@ def create_dataloaders(source_train_path, target_train_path, target_test_path):
     
     all_rss_cols = sorted(list(all_ap_cols_set)) # APの列名をソートして固定順にする (重要)
 
+    # rsl_only_cols = all_rss_cols
+    # rsl_only_cols = [col for col in all_rss_cols if col.endswith('_rsl')]
     rsl_only_cols = [col for col in all_rss_cols if col.endswith('_rng_rng')]
+
+    # APフィルタリング
+    if ap_filter_list:
+        # ap_filter_list に要素がある場合（特定のAPを指定した場合）
+        final_rss_cols = []
+        for col in rsl_only_cols:
+            # col が ap_filter_list のいずれかの要素で始まるかチェックする
+            if any(col.startswith(ap) for ap in ap_filter_list):
+                final_rss_cols.append(col)
+    else:
+        # ap_filter_list が空のリストの場合（全てのAPを指定したい場合）
+        # rsl_only_cols の内容をそのまま使用する
+        final_rss_cols = rsl_only_cols
 
     # 2. 各データセットを整形する (AP列の統一と欠損値の埋め合わせ)
     source_train_aligned = align_dataframe_columns(source_train_raw.copy(), all_rss_cols + loc_cols)
@@ -84,10 +103,16 @@ def create_dataloaders(source_train_path, target_train_path, target_test_path):
 
     # Load data for scaling (整形後のデータを使用)
     # Concatenate all RSS data for a comprehensive scaling range
+    # all_rss_data = pd.concat([
+    #     source_train_aligned[rsl_only_cols],
+    #     target_train_aligned[rsl_only_cols],
+    #     target_test_aligned[rsl_only_cols]
+    # ])
+    # Load data for scaling
     all_rss_data = pd.concat([
-        source_train_aligned[rsl_only_cols],
-        target_train_aligned[rsl_only_cols],
-        target_test_aligned[rsl_only_cols]
+        source_train_aligned[final_rss_cols], 
+        target_train_aligned[final_rss_cols],
+        target_test_aligned[final_rss_cols]
     ])
     
     # Concatenate all location data for scaling
@@ -112,9 +137,12 @@ def create_dataloaders(source_train_path, target_train_path, target_test_path):
     loc_transform = lambda y: loc_scaler.transform(y.reshape(1, -1)).flatten()
 
     # Create datasets (整形済みのDataFrameを渡す)
-    source_train_dataset = WiFiDataset(source_train_aligned, rsl_only_cols, loc_cols, transform=rss_transform, target_transform=loc_transform)
-    target_train_dataset = WiFiDataset(target_train_aligned, rsl_only_cols, loc_cols, transform=rss_transform, target_transform=loc_transform)
-    target_test_dataset = WiFiDataset(target_test_aligned, rsl_only_cols, loc_cols, transform=rss_transform, target_transform=loc_transform)
+    # source_train_dataset = WiFiDataset(source_train_aligned, rsl_only_cols, loc_cols, transform=rss_transform, target_transform=loc_transform)
+    # target_train_dataset = WiFiDataset(target_train_aligned, rsl_only_cols, loc_cols, transform=rss_transform, target_transform=loc_transform)
+    # target_test_dataset = WiFiDataset(target_test_aligned, rsl_only_cols, loc_cols, transform=rss_transform, target_transform=loc_transform)
+    source_train_dataset = WiFiDataset(source_train_aligned, final_rss_cols, loc_cols, transform=rss_transform, target_transform=loc_transform)
+    target_train_dataset = WiFiDataset(target_train_aligned, final_rss_cols, loc_cols, transform=rss_transform, target_transform=loc_transform)
+    target_test_dataset = WiFiDataset(target_test_aligned, final_rss_cols, loc_cols, transform=rss_transform, target_transform=loc_transform)
 
     # Create dataloaders
     batch_size = 64 # You can adjust this
@@ -136,7 +164,8 @@ def create_dataloaders(source_train_path, target_train_path, target_test_path):
     data_scalers = {
         'rss_scaler': rss_scaler,
         'loc_scaler': loc_scaler,
-        'rss_cols': rsl_only_cols, # ここをall_rss_colsに変更
+        # 'rss_cols': rsl_only_cols, # ここをall_rss_colsに変更
+        'rss_cols': final_rss_cols, # APフィルタリング
         'loc_cols': loc_cols,
         'target_train_loc_counts': target_train_loc_counts # 追加: 各座標のデータ総数を格納
     }
@@ -995,10 +1024,10 @@ if __name__ == "__main__":
     # target_test_path = f'./data/{place_name}/csv/{place_name}_{test_fnum}_testing.csv'
 
     # date = '20251030'
-    train_date = '20251214'
-    test_date = '20251214'
-    train_scene = '5Anchors_1Tag_non_obst'#'non_obst'#'half_wall_A'#'Tripod_non_obst'
-    test_scene = '5Anchors_1Tag_aluminu4_whiteboard_A'#'Aluminum_foilW_A_35'#'1805NLOS_Aluminu_foilW'#'Tripod_aluminum_foil_whiteboard_A'#'wall_A'#'wall_A'#'non_obst'#'1_lounges_whiteboard_A'#'wall'
+    train_date = '20251228'
+    test_date = '20251228'
+    train_scene = '12Anchors_1Tag_non_obst'#'non_obst'#'half_wall_A'#'Tripod_non_obst'
+    test_scene = '12Anchors_1Tag_wallA_15'#'Aluminum_foilW_A_35'#'1805NLOS_Aluminu_foilW'#'Tripod_aluminum_foil_whiteboard_A'#'wall_A'#'wall_A'#'non_obst'#'1_lounges_whiteboard_A'#'wall'
     # source_train_path = f'./data/uwb/processed_uwb_full_features_data_{train_scene}.csv'
     # target_train_path = f'./data/uwb/processed_uwb_full_features_data_{test_scene}_train_split.csv'
     # target_test_path = f'./data/uwb/processed_uwb_full_features_data_{test_scene}_test_split.csv'
@@ -1009,8 +1038,30 @@ if __name__ == "__main__":
     target_train_path = f'./data/uwb/{test_date}/processed_uwb_full_features_data_{test_scene}_train_split.csv'
     target_test_path = f'./data/uwb/{test_date}/processed_uwb_full_features_data_{test_scene}_test_split.csv'
 
+    # ap_filter_list = [
+    #     # 'AP910',
+    #     'AP4250',
+    #     'AP4245',
+    #     'AP17057',
+    #     # 'AP23196'
+    # ]
+    ap_filter_list = { # 12Anchors
+        # 'AP4524': 4524, # (0, -1.5)
+        # 'AP5307': 5307, # (0, 3)
+        'AP36794': 36794, # (-1.5, 0)
+        'AP37248': 37248, # (-1.5, 1.5)
+        # 'AP37051': 37051, # (3, 1.5)
+        # 'AP7091': 7091, # (3, 0)
+        'AP1805': 1805, # (1.5, -1.5)
+        'AP910': 910, # (3, 3)
+        'AP4250': 4250, # (0.75, 3)
+        'AP17057': 17057, # (0.75, -1.5)
+        # 'AP37045': 37045, # (-1.5, 0.75)
+        # 'AP23196': 23196 # (3, 0.75)
+    }
+
     source_train_loader, target_train_loader, target_test_loader, data_scalers = create_dataloaders(
-        source_train_path, target_train_path, target_test_path
+        source_train_path, target_train_path, target_test_path, ap_filter_list
     )
 
     # 入力/出力次元の取得
@@ -1054,7 +1105,7 @@ if __name__ == "__main__":
     all_epochs_detailed_pseudo_label_stats, \
     last_epoch_pseudo_data = train_transloc( # この行を修正
         model, source_train_loader, target_train_loader, target_test_loader, data_scalers,
-                    num_epochs=50, #200,
+                    num_epochs=70, #200,
                     lr_fe_lp=0.0002,
                     lr_g=0.0002,
                     lr_d=0.0002,
