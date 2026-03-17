@@ -1,0 +1,25 @@
+# --- 仮想環境 ---
+# 仮想環境の実体はOSに依存するため共有しません
+uwbtransloc-env/
+# env/
+# venv/
+# .venv/
+# bin/
+# Include/
+# Lib/
+# Scripts/
+
+# --- Pythonのキャッシュ ---
+# 実行時に自動生成される不要なファイル
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# --- OS・エディタ関連 ---
+.DS_Store
+.vscode/
+.idea/
+
+# --- プロジェクト固有の設定（環境変数など） ---
+.env
